@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.1
-// @description  罗盘全站通用探针。平时你正常逛罗盘，它悄悄把每页结构记下来；点“一键扫全部页面”，它自己顺着顶上导航栏一页一页翻过去抓完；最后点“导出全部结构”，只下一个总文件。每页都把导航栏原样记下来，不再猜导航长什么样。
+// @version      1.1.2
+// @description  罗盘全站通用探针。顶栏每项是带 data-subway-href 的 div（不是链接），探针按这个认页面；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
 // @match        https://fxg.jinritemai.com/ffa/mcompass/*
@@ -16,6 +16,7 @@
 
   var STORE_KEY = 'spaceImport.probe.pages.v1';
   var WALK_KEY = 'spaceImport.probe.walk.v1';
+  var SUBMENU_KEY = 'spaceImport.probe.submenus.v1';
 
   function clean(s) { return String(s == null ? '' : s).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(); }
 
@@ -95,16 +96,27 @@
       });
     }
 
+    // 顶上导航栏的页面清单：地址在 data-subway-href 里（div，不是 <a> 链接）。
+    // 再加以前悬停枚举到的下拉子页面。
     var seenHref = {};
+    function addNavPage(name, href, parent) {
+      if (!href) return;
+      var full = href.indexOf('http') === 0 ? href : (href.charAt(0) === '/' ? location.origin + href : location.origin + '/' + href);
+      if (seenHref[full]) return;
+      var t = clean(name || '');
+      if (!t) return;
+      seenHref[full] = true;
+      out.navPages.push({ name: t.slice(0, 40), href: full, parent: parent || '' });
+    }
+    Array.from(document.querySelectorAll('[data-subway-href]')).forEach(function (el) {
+      addNavPage(el.innerText || el.textContent, el.getAttribute('data-subway-href'), '');
+    });
+    var storedSubs = storeGet(SUBMENU_KEY, []);
+    storedSubs.forEach(function (sp) { addNavPage(sp.name, sp.href, sp.parent); });
     Array.from(document.querySelectorAll('a[href]')).forEach(function (a) {
       var href = a.getAttribute('href') || '';
       if (href.indexOf('/shop/') === -1 && href.indexOf('compass.jinritemai.com') === -1) return;
-      var full = href.indexOf('http') === 0 ? href : location.origin + href;
-      if (seenHref[full]) return;
-      var t = clean(a.innerText || a.textContent || '');
-      if (!t) return;
-      seenHref[full] = true;
-      out.navPages.push({ name: t.slice(0, 40), href: full });
+      addNavPage(a.innerText || a.textContent, href, '');
     });
 
     var bodyText = clean(document.body.innerText || document.body.textContent || '');
@@ -160,24 +172,66 @@
     status('本页已导出，也已记下来（共收录 ' + n + ' 页）。');
   }
 
-  // ---- 一键扫全部：顺着菜单自己翻页，扫完只下一个总文件 ----
-  function startWalk() {
-    var d = dump();
-    var queue = d.navPages.filter(function (p) { return p.href.indexOf(location.origin) === 0; });
-    if (!queue.length) {
-      // 导航栏里的项不是链接（点一下跳转的那种），翻页队排不出来。
-      // 先把这页结构（含导航栏原样）记下来，发我看一眼再改，不硬猜。
-      savePage(d);
-      status('这页导航栏里的项不是链接，自动翻页排不出来。已把这页结构记下来了，点“导出全部结构”发我，我看一眼导航栏到底长什么样再改。');
-      refreshPanel();
-      return;
+  // ---- 下拉子页面枚举：逐项悬停顶栏，出来下拉就把里面的子页面记下来 ----
+  // 顶栏每项都是 ecom-dropdown-trigger，子页面只在悬停后出现，不悬停看不到。
+  function collectSubmenus(done) {
+    var tops = Array.from(document.querySelectorAll('#compass-shop-header [data-subway-href], .menuName-iiOPo5[data-subway-href]'));
+    if (!tops.length) { if (done) done(0); return; }
+    var known = {};
+    Array.from(document.querySelectorAll('[data-subway-href]')).forEach(function (el) {
+      known[el.getAttribute('data-subway-href')] = true;
+    });
+    var found = storeGet(SUBMENU_KEY, []);
+    var foundHref = {};
+    found.forEach(function (sp) { foundHref[sp.href] = true; });
+    var i = 0;
+    function step() {
+      if (i >= tops.length) {
+        storeSet(SUBMENU_KEY, found);
+        if (done) done(found.length);
+        return;
+      }
+      var top = tops[i];
+      var parentName = clean(top.innerText || top.textContent || '');
+      try {
+        top.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        top.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      } catch (e) { /* 忽略 */ }
+      setTimeout(function () {
+        Array.from(document.querySelectorAll('[data-subway-href]')).forEach(function (el) {
+          var href = el.getAttribute('data-subway-href');
+          if (!href || known[href]) return;
+          var full = href.charAt(0) === '/' ? location.origin + href : href;
+          if (foundHref[full]) return;
+          foundHref[full] = true;
+          found.push({ name: clean(el.innerText || el.textContent || '').slice(0, 40), href: full, parent: parentName });
+        });
+        i++;
+        step();
+      }, 500);
     }
-    // 当前页先算进去，队列里去掉当前页
-    savePage(d);
-    queue = queue.filter(function (p) { return p.href.split('#')[0] !== location.href.split('#')[0]; });
-    storeSet(WALK_KEY, { queue: queue, index: 0, total: queue.length + 1, startedAt: new Date().toISOString() });
-    status('开始扫全部页面，共 ' + (queue.length + 1) + ' 页，正在去第 2 页…');
-    setTimeout(function () { location.href = queue[0].href; }, 800);
+    step();
+  }
+
+  // ---- 一键扫全部：顺着顶上导航栏自己翻页，扫完只下一个总文件 ----
+  function startWalk() {
+    status('先把顶栏每一项的下拉子页面认一遍…');
+    collectSubmenus(function () {
+      var d = dump();
+      var queue = d.navPages.filter(function (p) { return p.href.indexOf(location.origin) === 0; });
+      if (!queue.length) {
+        savePage(d);
+        status('顶栏里没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
+        refreshPanel();
+        return;
+      }
+      // 当前页先算进去，队列里去掉当前页
+      savePage(d);
+      queue = queue.filter(function (p) { return p.href.split('#')[0].split('?')[0] !== location.href.split('#')[0].split('?')[0]; });
+      storeSet(WALK_KEY, { queue: queue, index: 0, total: queue.length + 1, startedAt: new Date().toISOString() });
+      status('开始扫全部页面，共 ' + (queue.length + 1) + ' 页，正在去第 2 页…');
+      setTimeout(function () { location.href = queue[0].href; }, 800);
+    });
   }
 
   function stopWalk() {
@@ -247,8 +301,9 @@
     };
     refreshPanel();
 
-    // 平时正常逛：每页加载后悄悄记下来，不用点。
-    // 扫描进行中：抓完这页就自动去下一页。
+    // 平时正常逛：每页加载后悄悄记下来，不用点；
+// 扫描进行中：抓完这页就自动去下一页。
+    // 顺便在后台把下拉子页面也认一遍，攒着以后走。
     setTimeout(function () {
       var walk = storeGet(WALK_KEY, null);
       if (walk && walk.queue && walk.queue.length) {
@@ -257,6 +312,7 @@
         var n = savePage(dump());
         var countEl = document.getElementById('sip-probe-count');
         if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
+        collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
       }
     }, 3000);
   }
