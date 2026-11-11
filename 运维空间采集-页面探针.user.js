@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.0.2
-// @description  罗盘全站通用探针：在罗盘任意一页点一下，导出那页的表头、分页、总数、日期控件、按钮，外加左边菜单里的全部页面清单（一页一个文件，文件名带页名）。
+// @version      1.1.0
+// @description  罗盘全站通用探针。平时你正常逛罗盘，它悄悄把每页结构记下来；点“一键扫全部页面”，它自己顺着菜单一页一页翻过去抓完；最后点“导出全部结构”，只下一个总文件。 structures 存浏览器本地，不发任何地方。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
 // @match        https://fxg.jinritemai.com/ffa/mcompass/*
@@ -14,7 +14,20 @@
 (function () {
   'use strict';
 
+  var STORE_KEY = 'spaceImport.probe.pages.v1';
+  var WALK_KEY = 'spaceImport.probe.walk.v1';
+
   function clean(s) { return String(s == null ? '' : s).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(); }
+
+  function storeGet(k, d) {
+    try { var s = localStorage.getItem(k); return s === null ? d : JSON.parse(s); } catch (e) { return d; }
+  }
+  function storeSet(k, v) {
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 忽略 */ }
+  }
+  function storeDel(k) {
+    try { localStorage.removeItem(k); } catch (e) { /* 忽略 */ }
+  }
 
   function elInfo(el) {
     var r = { tag: el.tagName.toLowerCase(), cls: (el.className && typeof el.className === 'string') ? el.className.slice(0, 200) : '' };
@@ -28,7 +41,7 @@
 
   function dump() {
     var out = {
-      tool: 'page-probe/1.0',
+      tool: 'page-probe/1.1',
       url: location.href,
       title: document.title,
       time: new Date().toISOString(),
@@ -40,7 +53,6 @@
       totalsText: []
     };
 
-    // 全部表格：表头原文、行数、首行、每列前两个单元格
     Array.from(document.querySelectorAll('table')).forEach(function (tb, ti) {
       var ths = Array.from(tb.querySelectorAll('thead th')).map(function (th) { return clean(th.innerText || th.textContent); });
       var rows = Array.from(tb.querySelectorAll('tbody tr'));
@@ -50,7 +62,6 @@
       out.tables.push({ index: ti, headers: ths, rowCount: rows.length, sampleRows: sample });
     });
 
-    // 分页区：整块原文 + 外层 HTML（截断到 8000 字，够看结构）
     var pag = document.querySelector('.arco-pagination, .auxo-pagination, .ecom-pagination, [class*="pagination"]');
     if (pag) {
       out.pagination.found = true;
@@ -61,8 +72,6 @@
       out.pagination.found = false;
     }
 
-    // 左边菜单里的全部页面清单：罗盘站内链接去重，名字 + 地址都有。
-    // 在任意一页点一下就能拿到整站目录，不用一页一页翻。
     var seenHref = {};
     Array.from(document.querySelectorAll('a[href]')).forEach(function (a) {
       var href = a.getAttribute('href') || '';
@@ -75,19 +84,16 @@
       out.navPages.push({ name: t.slice(0, 40), href: full });
     });
 
-    // 全页找“共 N 条 / 共 N 页 / x / y”这类总数文字
     var bodyText = clean(document.body.innerText || document.body.textContent || '');
     var re = /共\s*\d+\s*[条页]|总数[^0-9]{0,5}\d+|\d+\s*\/\s*\d+/g;
     var m;
     while ((m = re.exec(bodyText)) !== null) out.totalsText.push(m[0]);
 
-    // 日期控件：选中的范围按钮
     Array.from(document.querySelectorAll('[class*="radio-button-wrapper-checked"], .arco-radio-checked, [aria-checked="true"]')).forEach(function (el) {
       var t = clean(el.innerText || el.textContent);
       if (t) out.dateControls.push(t.slice(0, 60));
     });
 
-    // 关键按钮：下一页 / 上一页 / 查询 / 导出
     Array.from(document.querySelectorAll('button, li, a')).forEach(function (el) {
       var t = clean(el.innerText || el.textContent);
       if (/下一页|上一页|查询|导出|下载/.test(t) && t.length < 30) out.buttons.push(elInfo(el));
@@ -96,17 +102,76 @@
     return out;
   }
 
-  function download() {
-    var data = dump();
-    var blob = new Blob(['\uFEFF' + JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+  function savePage(d) {
+    var all = storeGet(STORE_KEY, {});
+    all[d.url] = d;
+    storeSet(STORE_KEY, all);
+    return Object.keys(all).length;
+  }
+
+  function downloadFile(filename, obj) {
+    var blob = new Blob(['\uFEFF' + JSON.stringify(obj, null, 2)], { type: 'application/json;charset=utf-8' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    var pageSlug = location.pathname.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page';
-    a.download = 'page-probe-' + pageSlug + '-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
-    status('已导出结构文件，发给 Edison 就行。');
+  }
+
+  function stamp() { return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-'); }
+
+  function exportAll() {
+    var all = storeGet(STORE_KEY, {});
+    var pages = Object.keys(all).map(function (k) { return all[k]; });
+    if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
+    downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.1', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
+    status('已导出全部结构：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
+  }
+
+  function exportThisPage() {
+    var d = dump();
+    var n = savePage(d);
+    var pageSlug = location.pathname.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page';
+    downloadFile('page-probe-' + pageSlug + '-' + stamp() + '.json', d);
+    status('本页已导出，也已记下来（共收录 ' + n + ' 页）。');
+  }
+
+  // ---- 一键扫全部：顺着菜单自己翻页，扫完只下一个总文件 ----
+  function startWalk() {
+    var d = dump();
+    var queue = d.navPages.filter(function (p) { return p.href.indexOf(location.origin) === 0; });
+    if (!queue.length) { status('这页没找到菜单，先打开罗盘里带左边菜单的页面再点。'); return; }
+    // 当前页先算进去，队列里去掉当前页
+    savePage(d);
+    queue = queue.filter(function (p) { return p.href.split('#')[0] !== location.href.split('#')[0]; });
+    storeSet(WALK_KEY, { queue: queue, index: 0, total: queue.length + 1, startedAt: new Date().toISOString() });
+    status('开始扫全部页面，共 ' + (queue.length + 1) + ' 页，正在去第 2 页…');
+    setTimeout(function () { location.href = queue[0].href; }, 800);
+  }
+
+  function stopWalk() {
+    storeDel(WALK_KEY);
+    status('已停止扫描。已收录的还在，点“导出全部结构”可以先发出来。');
+    refreshPanel();
+  }
+
+  function walkStep() {
+    var walk = storeGet(WALK_KEY, null);
+    if (!walk || !walk.queue || !walk.queue.length) return false;
+    var n = savePage(dump());
+    var next = walk.index + 1;
+    if (next >= walk.queue.length) {
+      storeDel(WALK_KEY);
+      status('全部扫完：共 ' + walk.total + ' 页，正在下一个总文件…');
+      setTimeout(exportAll, 600);
+      return true;
+    }
+    walk.index = next;
+    storeSet(WALK_KEY, walk);
+    status('正在扫第 ' + (next + 1) + ' / 共 ' + walk.total + ' 页：' + (walk.queue[next].name || '') + '（已收录 ' + n + ' 页）');
+    setTimeout(function () { location.href = walk.queue[next].href; }, 1200);
+    return true;
   }
 
   function status(msg) {
@@ -114,17 +179,56 @@
     if (el) el.textContent = msg;
   }
 
+  function refreshPanel() {
+    var all = storeGet(STORE_KEY, {});
+    var countEl = document.getElementById('sip-probe-count');
+    if (countEl) countEl.textContent = '已收录 ' + Object.keys(all).length + ' 页';
+    var walk = storeGet(WALK_KEY, null);
+    var stopBtn = document.getElementById('sip-probe-stop');
+    if (stopBtn) stopBtn.style.display = walk ? 'inline-block' : 'none';
+    var walkBtn = document.getElementById('sip-probe-walk');
+    if (walkBtn) walkBtn.style.display = walk ? 'none' : 'inline-block';
+  }
+
   function init() {
     if (document.getElementById('sip-probe-panel')) return;
     var div = document.createElement('div');
     div.id = 'sip-probe-panel';
-    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:12px 14px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:280px;font-family:sans-serif;';
-    div.innerHTML = '<div style="font-weight:700;margin-bottom:6px;">页面探针</div>'
-      + '<div style="color:#cbd5e1;margin-bottom:8px;">点一下，把这页的表头、分页、总数整页结构导成一个文件。</div>'
-      + '<button id="sip-probe-btn" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;">导出页面结构</button>'
+    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:12px 14px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
+    div.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">页面探针</div>'
+      + '<div id="sip-probe-count" style="color:#cbd5e1;margin-bottom:8px;">已收录 0 页</div>'
+      + '<div style="margin-bottom:8px;">'
+      + '<button id="sip-probe-walk" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">一键扫全部页面</button>'
+      + '<button id="sip-probe-stop" style="background:#dc2626;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;display:none;">停止</button>'
+      + '<button id="sip-probe-all" style="background:#059669;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">导出全部结构</button>'
+      + '</div>'
+      + '<div><button id="sip-probe-one" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">只导出本页</button>'
+      + '<button id="sip-probe-clear" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;margin-left:6px;">清空已收录</button></div>'
       + '<div id="sip-probe-status" style="margin-top:8px;color:#94a3b8;"></div>';
     document.body.appendChild(div);
-    document.getElementById('sip-probe-btn').onclick = download;
+    document.getElementById('sip-probe-walk').onclick = startWalk;
+    document.getElementById('sip-probe-stop').onclick = stopWalk;
+    document.getElementById('sip-probe-all').onclick = exportAll;
+    document.getElementById('sip-probe-one').onclick = exportThisPage;
+    document.getElementById('sip-probe-clear').onclick = function () {
+      storeDel(STORE_KEY);
+      refreshPanel();
+      status('已清空，重新开始收。');
+    };
+    refreshPanel();
+
+    // 平时正常逛：每页加载后悄悄记下来，不用点。
+    // 扫描进行中：抓完这页就自动去下一页。
+    setTimeout(function () {
+      var walk = storeGet(WALK_KEY, null);
+      if (walk && walk.queue && walk.queue.length) {
+        walkStep();
+      } else {
+        var n = savePage(dump());
+        var countEl = document.getElementById('sip-probe-count');
+        if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
+      }
+    }, 3000);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
