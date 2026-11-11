@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.2.2
+// @version      1.2.3
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。v1.2：设置面板里填一次 VPS 地址+钥匙（存浏览器本地，随时能改），填了就先发 VPS，没填或发不出去自动改回本地下载。
@@ -158,38 +158,80 @@ function extractCellParts(cell) {
   return text.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
 }
 
-// buildColumnMap：V4.0 getColumnMap 的改写，精确匹配优先。
-// spec: [{ key, exact, allowIncludes }]
-// 商品曝光人数等关键列只认精确表头原文，绝不用“第一个含 X 的列”（旧 v5 的 bug）。
-function buildColumnMap(headers, spec) {
+// buildColumnMap：自适应列定位，改名也不用回来改代码。
+// 认列顺序（按顺序试，先中的为准）：
+//   ① 精确表头原文 → ② 以前学过的别名（存在浏览器本地）
+//   → ③ 脚本里写的旧名 → ④ 去括号核心词（如“商品点击率(人数)”去括号后就是“商品点击率”）
+//   → ⑤ 按列位置兜底（表头顺序基本不变；按位置对上的会标出来让你核对）。
+// 只有五步全认不到，才报缺列停下。返回 how 说明每列是怎么认到的，
+// learnedNew 是这次新学到的别名，采完存起来，下次直接按名认。
+function coreOf(h) {
+  return cleanText(h).replace(/[（(][^）)]*[）)]/g, '').replace(/\s+/g, '');
+}
+function buildColumnMap(headers, spec, learned) {
   var norm = headers.map(function (h) { return cleanText(h).replace(/\s+/g, ''); });
+  var core = headers.map(function (h) { return coreOf(h); });
   var map = {};
   var missing = [];
+  var how = {};
+  var learnedNew = {};
+  learned = learned || {};
   spec.forEach(function (s) {
     var idx = -1;
+    var mode = '';
     var exactNorm = s.exact.replace(/\s+/g, '');
-    for (var i = 0; i < norm.length; i++) {
-      if (norm[i] === exactNorm) { idx = i; break; }
+    for (var i = 0; i < norm.length && idx === -1; i++) {
+      if (norm[i] === exactNorm) { idx = i; mode = 'exact'; }
     }
-    // 2026-11-11 实测：页面表头会改名（如“搜索词”改成“搜索词信息”），
-    // 先认新名，认不到再认旧名，两个都不认才报缺列停下。
-    if (idx === -1 && s.alts) {
-      for (var a = 0; a < s.alts.length && idx === -1; a++) {
-        var altNorm = s.alts[a].replace(/\s+/g, '');
+    if (idx === -1) {
+      var known = (learned[s.key] || []).concat(s.alts || []);
+      for (var a = 0; a < known.length && idx === -1; a++) {
+        var altNorm = String(known[a]).replace(/\s+/g, '');
         for (var k = 0; k < norm.length; k++) {
-          if (norm[k] === altNorm) { idx = k; break; }
+          if (norm[k] === altNorm) { idx = k; mode = 'learned'; }
         }
       }
     }
-    if (idx === -1 && s.allowIncludes) {
-      for (var j = 0; j < norm.length; j++) {
-        if (norm[j].indexOf(exactNorm) !== -1) { idx = j; break; }
+    if (idx === -1 && s.core) {
+      var coreNorm = s.core.replace(/\s+/g, '');
+      for (var j = 0; j < core.length && idx === -1; j++) {
+        if (core[j] === coreNorm) { idx = j; mode = 'core'; }
+      }
+      if (idx === -1) {
+        var hits = [];
+        for (var m = 0; m < core.length; m++) {
+          if (core[m].indexOf(coreNorm) !== -1) hits.push(m);
+        }
+        if (hits.length === 1) { idx = hits[0]; mode = 'core'; }
       }
     }
+    if (idx === -1 && typeof s.pos === 'number' && s.pos < norm.length) {
+      idx = s.pos; mode = 'pos';
+    }
     if (idx === -1) { missing.push(s.exact); }
-    else { map[s.key] = idx; }
+    else {
+      map[s.key] = idx;
+      how[s.key] = mode;
+      if (mode === 'core' || mode === 'pos') {
+        var htxt = headers[idx];
+        var already = (learned[s.key] || []).concat(s.alts || []);
+        if (htxt && already.indexOf(htxt) === -1 && htxt !== s.exact) learnedNew[s.key] = htxt;
+      }
+    }
   });
-  return { map: map, missing: missing };
+  return { map: map, missing: missing, how: how, learnedNew: learnedNew };
+}
+
+// 学过的表头别名存在浏览器本地（油猴存储），不在脚本文件里，
+// 面板设置区能看、能清；清掉就回到只认脚本里写的名字。
+var HEADER_ALTS_KEY = 'spaceImport.collector.headerAlts.v1';
+function loadHeaderAlts() {
+  var raw = gmGet(HEADER_ALTS_KEY, '');
+  if (!raw) return {};
+  try { var o = JSON.parse(raw); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; }
+}
+function saveHeaderAlts(alts) {
+  try { gmSet(HEADER_ALTS_KEY, JSON.stringify(alts)); } catch (e) { /* 忽略 */ }
 }
 
 // 搜索词表指纹：表头含 ≥3 个关键词才认（结构地图 tableFingerprints 思路）。
@@ -509,18 +551,18 @@ async function waitForNewData(table, prevSig, isCollecting) {
 // ============================================================
 
 var SEARCH_SPEC = [
-  { key: 'search_term', exact: '搜索词信息', alts: ['搜索词'], allowIncludes: false },
+  { key: 'search_term', exact: '搜索词信息', alts: ['搜索词'], core: '搜索词', pos: 1, allowIncludes: false },
   // 关键：商品曝光人数只认精确表头“商品曝光人数”。
   // “搜索结果曝光人数”是另一列（第 3 列），旧 v5 取第一个含“曝光人数”的列
   // 抓到的是搜索曝光，这版绝不能重犯。
-  { key: 'search_result_exposure', exact: '搜索结果曝光人数', allowIncludes: false },
-  { key: 'search_people', exact: '搜索人数', allowIncludes: false },
-  { key: 'search_payment_amount', exact: '搜索用户支付金额', allowIncludes: false },
-  { key: 'product_exposure', exact: '商品曝光人数', allowIncludes: false },
-  { key: 'product_click_rate', exact: '商品点击率(人数)', alts: ['商品点击率'], allowIncludes: false },
-  { key: 'product_click_conversion_rate', exact: '商品点击-成交转化率(人数)', alts: ['商品点击-成交转化率'], allowIncludes: false },
-  { key: 'shop_exposed_products', exact: '词下本店曝光商品', allowIncludes: true },
-  { key: 'hot_products', exact: '词下热门商品', allowIncludes: true }
+  { key: 'search_result_exposure', exact: '搜索结果曝光人数', core: '搜索结果曝光人数', pos: 2, allowIncludes: false },
+  { key: 'search_people', exact: '搜索人数', core: '搜索人数', pos: 3, allowIncludes: false },
+  { key: 'search_payment_amount', exact: '搜索用户支付金额', core: '搜索用户支付金额', pos: 4, allowIncludes: false },
+  { key: 'product_exposure', exact: '商品曝光人数', core: '商品曝光人数', pos: 5, allowIncludes: false },
+  { key: 'product_click_rate', exact: '商品点击率(人数)', alts: ['商品点击率'], core: '商品点击率', pos: 6, allowIncludes: false },
+  { key: 'product_click_conversion_rate', exact: '商品点击-成交转化率(人数)', alts: ['商品点击-成交转化率'], core: '商品点击-成交转化率', pos: 8, allowIncludes: false },
+  { key: 'shop_exposed_products', exact: '词下本店曝光商品', core: '词下本店曝光商品', pos: 9, allowIncludes: true },
+  { key: 'hot_products', exact: '词下热门商品', core: '词下热门商品', pos: 10, allowIncludes: true }
 ];
 // 必备列：缺任何一列就报错停下，不静默填空。
 var SEARCH_REQUIRED = ['search_term', 'search_result_exposure', 'search_people', 'search_payment_amount', 'product_exposure', 'product_click_rate', 'product_click_conversion_rate'];
@@ -542,7 +584,8 @@ function collectSearchPage() {
   if (!found) return { ok: false, errors: ['未找到搜索词表：页面上没有含“搜索词/商品曝光人数”等表头的表格。请确认打开的是罗盘搜索词分析页，且表格已加载。'] };
   var table = found.table;
   var headers = readHeaders(table);
-  var built = buildColumnMap(headers, SEARCH_SPEC);
+  var learned = loadHeaderAlts();
+  var built = buildColumnMap(headers, SEARCH_SPEC, learned);
   var missingRequired = SEARCH_REQUIRED.filter(function (k) { return built.map[k] === undefined; });
   if (missingRequired.length) {
     var missingNames = missingRequired.map(function (k) {
@@ -552,6 +595,18 @@ function collectSearchPage() {
     return { ok: false, errors: ['表头缺列，先停下不采：缺 ' + missingNames.join('、') + '。页面实际表头：' + headers.join(' | ')] };
   }
   searchState.headers = headers;
+  // 新学到的别名存起来，下次直接按名认；按位置对上的列在面板里标出来核对。
+  var newNames = Object.keys(built.learnedNew || {});
+  if (newNames.length) {
+    newNames.forEach(function (k) {
+      learned[k] = (learned[k] || []).concat([built.learnedNew[k]]);
+    });
+    saveHeaderAlts(learned);
+  }
+  var posCols = Object.keys(built.how || {}).filter(function (k) { return built.how[k] === 'pos'; });
+  searchState.columnNote = posCols.length
+    ? '提醒：' + posCols.length + ' 列是按位置对上的（表头没认出来），导出前请核对一下这几列的数。'
+    : (newNames.length ? '已自动记住新表头名，下次直接认。' : '');
   var m = built.map;
   var rows = table.querySelectorAll('tbody tr');
   var added = 0;
@@ -621,7 +676,7 @@ async function runSearchCollect(autoPaging) {
         panelStatus('已停：' + res.errors[0]);
         break;
       }
-      panelStatus('第 ' + page + ' 页完成，本页新增 ' + res.added + ' 条，总计 ' + searchState.rows.length + ' 条');
+      panelStatus('第 ' + page + ' 页完成，本页新增 ' + res.added + ' 条，总计 ' + searchState.rows.length + ' 条' + (searchState.columnNote ? '。' + searchState.columnNote : ''));
       if (!autoPaging) break;
       if (page >= maxPages) break;
       var found = findTableByFingerprint(fingerprintSearchTable);
