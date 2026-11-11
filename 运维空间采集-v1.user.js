@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.0.3
+// @version      1.0.4
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。
@@ -229,8 +229,13 @@ function findTableByFingerprint(fingerprintFn) {
 
 function rowSignature(table) {
   var rows = table.querySelectorAll('tbody tr');
-  var first = rows.length ? cleanText(rows[0].innerText || rows[0].textContent).slice(0, 60) : '';
-  return rows.length + '|' + first;
+  // 2026-11-11 实测：tbody 第一行就是表头原文，各页都一样；
+  // 只看首行翻页永远等超时——这就是“翻一页就停”的真因。
+  // 签名看第二行（第一条数据）+ 末行 + 行数。
+  function rowText(tr) { return cleanText(tr.innerText || tr.textContent).slice(0, 60); }
+  var first = rows.length > 1 ? rowText(rows[1]) : (rows.length ? rowText(rows[0]) : '');
+  var last = rows.length ? rowText(rows[rows.length - 1]) : '';
+  return rows.length + '|' + first + '|' + last;
 }
 
 // 日期范围：读页面当前选中的范围写进导出，不写死“今日/近7天/近30天”。
@@ -352,6 +357,8 @@ function panelErrors(list) {
 // 新做法：开始先读总页数，翻页优先直接点下一页的页码数字，
 // 每一页都报“第 X / 共 Y 页”，翻不动就明说停在哪一页，不当采完。
 var NEXT_SELECTORS = [
+  '.aurora-pagination-next:not(.aurora-pagination-disabled) button',
+  '.aurora-pagination-next:not(.aurora-pagination-disabled)',
   '.arco-pagination-next:not(.arco-pagination-disabled):not([aria-disabled="true"]) button',
   '.auxo-pagination-next:not([aria-disabled="true"]) button',
   '.ecom-pagination-next:not([aria-disabled="true"]) button',
@@ -408,6 +415,7 @@ function findPageButton(n) {
     if (isDisabledEl(el) || !visibleEl(el)) continue;
     var c = (el.className && typeof el.className === 'string') ? el.className : '';
     if (c.indexOf('active') !== -1 || el.getAttribute('aria-current') === 'true') continue;
+    if (el.tagName === 'A' && el.parentElement && /aurora-pagination-item/.test(el.parentElement.className || '')) return el.parentElement;
     return el;
   }
   return null;
@@ -508,9 +516,15 @@ function searchTermFromCell(cell) {
   return parts.length ? parts[0] : '';
 }
 
-function collectSearchPage() {
-  var found = findTableByFingerprint(fingerprintSearchTable);
-  if (!found) return { ok: false, errors: ['未找到搜索词表：页面上没有含“搜索词/商品曝光人数”等表头的表格。请确认打开的是罗盘搜索词分析页，且表格已加载。'] };
+async function collectSearchPage() {
+  // 表是异步加载的：等表出现（最多 15 秒），别一上来找不到就报错。
+  // 2026-11-11 实测：搜索词页第一次打开 3 秒内表还没出来。
+  var found = null;
+  for (var w = 0; w < 30 && !found; w++) {
+    found = findTableByFingerprint(fingerprintSearchTable);
+    if (!found) await sleep(500);
+  }
+  if (!found) return { ok: false, errors: ['等了 15 秒还是没找到搜索词表：页面上没有含“搜索词/商品曝光人数”等表头的表格。请确认打开的是罗盘搜索词分析页，且表格已加载。'] };
   var table = found.table;
   var headers = readHeaders(table);
   var built = buildColumnMap(headers, SEARCH_SPEC);
@@ -544,6 +558,8 @@ function collectSearchPage() {
     }
     var term = searchTermFromCell(cellAt('search_term'));
     if (!term) return;
+    // tbody 第一行就是表头原文（2026-11-11 实测），不是数据，跳过。
+    if (term === headers[m['search_term']]) return;
     if (seen[term]) return;
     seen[term] = true;
     var sre = numAt('search_result_exposure');
@@ -589,7 +605,7 @@ async function runSearchCollect(autoPaging) {
   try {
     while (!searchState.stop) {
       panelStatus('正在采集第 ' + page + (totalPages ? ' / 共 ' + totalPages : '') + ' 页…（已采 ' + searchState.rows.length + ' 条）');
-      var res = collectSearchPage();
+      var res = await collectSearchPage();
       if (!res.ok) {
         searchState.errors = res.errors;
         panelErrors(res.errors);

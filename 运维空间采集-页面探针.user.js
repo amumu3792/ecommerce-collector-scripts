@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.5
+// @version      1.1.6
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -102,7 +102,7 @@
       out.navBar.html = navBar.outerHTML.slice(0, 6000);
       out.navBar.items = [];
       var seenNav = {};
-      Array.from(navBar.querySelectorAll('a, button, li, [role="menuitem"], [role="tab"]')).forEach(function (el) {
+      Array.from(navBar.querySelectorAll('a, button, li, [role="menuitem"], [role="tab"], .menuName-iiOPo5, [data-subway-href]')).forEach(function (el) {
         var t = clean(el.innerText || el.textContent || '');
         if (!t || t.length > 20 || seenNav[t]) return;
         seenNav[t] = true;
@@ -170,6 +170,23 @@
     });
 
     return out;
+  }
+
+  // 等表出来再抓：很多页数据是异步加载的，3 秒不够就抓空。
+  // 每秒看一次，最多等 15 秒；实在没表也照常抓（记个空）。
+  function waitForTables(done) {
+    var waited = 0;
+    var timer = setInterval(function () {
+      waited += 1000;
+      var has = false;
+      try {
+        var tbs = document.querySelectorAll('table');
+        for (var i = 0; i < tbs.length; i++) {
+          if (tbs[i].querySelectorAll('tbody tr').length) { has = true; break; }
+        }
+      } catch (e) { /* 忽略 */ }
+      if (has || waited >= 15000) { clearInterval(timer); done(); }
+    }, 1000);
   }
 
   function savePage(d) {
@@ -311,6 +328,9 @@
   function walkTakeNext() {
     var walk = storeGet(WALK_KEY, null);
     if (!walk) return;
+    waitForTables(function () { walkTakeNextGo(walk); });
+  }
+  function walkTakeNextGo(walk) {
     var d = dump();
     var n = savePage(d);
     refreshPanel();
@@ -416,10 +436,12 @@
       if (walk && walk.queue && walk.queue.length) {
         walkStep();
       } else {
-        var n = savePage(dump());
+        waitForTables(function () {
+          var n = savePage(dump());
         var countEl = document.getElementById('sip-probe-count');
         if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
-        if (!storeGet(SUBMENU_KEY, []).length) collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
+          if (!storeGet(SUBMENU_KEY, []).length) collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
+        });
       }
     }, 3000);
   }
