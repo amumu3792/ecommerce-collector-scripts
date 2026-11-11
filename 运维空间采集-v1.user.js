@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.0.1
+// @version      1.0.2
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。
@@ -347,7 +347,10 @@ function panelErrors(list) {
   el.textContent = list.join('\n');
 }
 
-// ---- 翻页：完整选择器矩阵＋动态等待＋页码兜底（V4.0 的改写） ----
+// ---- 翻页：先读总页数，再按页码翻到底（v1.2.4 改写） ----
+// 老做法只会一路点“下一页”，点不动就悄悄停，还当成采完了。
+// 新做法：开始先读总页数，翻页优先直接点下一页的页码数字，
+// 每一页都报“第 X / 共 Y 页”，翻不动就明说停在哪一页，不当采完。
 var NEXT_SELECTORS = [
   '.arco-pagination-next:not(.arco-pagination-disabled):not([aria-disabled="true"]) button',
   '.auxo-pagination-next:not([aria-disabled="true"]) button',
@@ -360,24 +363,87 @@ var NEXT_SELECTORS = [
   '.ecom-pagination-next:not(.ecom-pagination-next-disabled)'
 ];
 
+function isDisabledEl(el) {
+  var n = el;
+  for (var i = 0; i < 4 && n; i++) {
+    if (n.disabled) return true;
+    if (n.getAttribute && n.getAttribute('aria-disabled') === 'true') return true;
+    var c = (n.className && typeof n.className === 'string') ? n.className : '';
+    if (c.indexOf('disabled') !== -1) return true;
+    n = n.parentElement;
+  }
+  return false;
+}
+function visibleEl(el) {
+  try {
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  } catch (e) { return true; }
+}
+
 function findNextButton() {
   for (var i = 0; i < NEXT_SELECTORS.length; i++) {
     var btn = document.querySelector(NEXT_SELECTORS[i]);
-    if (btn) return btn;
+    if (btn && !isDisabledEl(btn) && visibleEl(btn)) return btn;
   }
   try {
     var xr = document.evaluate(
       "//button[contains(., '下一页') and not(@disabled)] | //li[@title='下一页' and not(@aria-disabled='true')]//button",
       document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
     );
-    if (xr.singleNodeValue) return xr.singleNodeValue;
+    var node = xr.singleNodeValue;
+    if (node && !isDisabledEl(node) && visibleEl(node)) return node;
   } catch (e) { /* 忽略 */ }
   return null;
 }
 
+// 直接点第 n 页的页码数字（比“下一页”按钮稳：末页没有下一页时也不会点错）。
+function findPageButton(n) {
+  var scope = document.querySelector('.arco-pagination, .auxo-pagination, .ecom-pagination, [class*="pagination"]') || document;
+  var els = scope.querySelectorAll('button, li, a');
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var t = cleanText(el.textContent || '');
+    if (t !== String(n)) continue;
+    if (isDisabledEl(el) || !visibleEl(el)) continue;
+    var c = (el.className && typeof el.className === 'string') ? el.className : '';
+    if (c.indexOf('active') !== -1 || el.getAttribute('aria-current') === 'true') continue;
+    return el;
+  }
+  return null;
+}
+
+// 读总页数：先看“共 N 条 / 共 N 页 / 1 / N”文字，再看页码按钮里最大的数字，
+// 最后用总条数除以每页行数算。读不到就返回 null，外面按“翻到底”走。
+function readPaginationTotal() {
+  var out = { totalPages: null, totalRows: null, pageSize: null };
+  var scope = document.querySelector('.arco-pagination, .auxo-pagination, .ecom-pagination, [class*="pagination"]') || document.body;
+  var text = cleanText(scope.innerText || scope.textContent || '');
+  var m = text.match(/共\s*(\d+)\s*条/);
+  if (m) out.totalRows = parseInt(m[1], 10);
+  var m2 = text.match(/共\s*(\d+)\s*页/);
+  if (m2) out.totalPages = parseInt(m2[1], 10);
+  var m3 = text.match(/(\d+)\s*\/\s*(\d+)/);
+  if (!out.totalPages && m3) out.totalPages = parseInt(m3[2], 10);
+  var nums = [];
+  var els = scope.querySelectorAll('button, li, a, span');
+  for (var i = 0; i < els.length; i++) {
+    var t = cleanText(els[i].textContent || '');
+    if (/^\d+$/.test(t)) nums.push(parseInt(t, 10));
+  }
+  var maxNum = nums.length ? Math.max.apply(null, nums) : 0;
+  if (!out.totalPages && maxNum > 1) out.totalPages = maxNum;
+  try {
+    var found = findTableByFingerprint(fingerprintSearchTable);
+    if (found) out.pageSize = found.table.querySelectorAll('tbody tr').length;
+  } catch (e) { /* 忽略 */ }
+  if (!out.totalPages && out.totalRows && out.pageSize) out.totalPages = Math.ceil(out.totalRows / out.pageSize);
+  return out;
+}
+
 // V4.0 waitForNewData 的改写：行签名（行数＋首行）变化才算翻页成功。
 async function waitForNewData(table, prevSig, isCollecting) {
-  var maxWait = 8000, interval = 500, waited = 0;
+  var maxWait = 10000, interval = 500, waited = 0;
   while (waited < maxWait) {
     if (isCollecting && !isCollecting()) return false;
     var t = findTableByFingerprint(fingerprintSearchTable);
@@ -387,6 +453,24 @@ async function waitForNewData(table, prevSig, isCollecting) {
     waited += interval;
   }
   return false;
+}
+
+// 翻到第 targetPage 页：先点页码数字，再点“下一页”；
+// 点一次没动静就再点一次（加载慢、第一次点击被加载态吞掉很常见）。
+// 返回 'ok' | 'no-button' | 'timeout' | 'stopped'。
+async function gotoPage(targetPage, prevSig, isCollecting) {
+  var btn = findPageButton(targetPage) || findNextButton();
+  if (!btn) return 'no-button';
+  btn.click();
+  if (await waitForNewData(null, prevSig, isCollecting)) return 'ok';
+  if (isCollecting && !isCollecting()) return 'stopped';
+  var btn2 = findPageButton(targetPage) || findNextButton();
+  if (btn2) {
+    btn2.click();
+    if (await waitForNewData(null, prevSig, isCollecting)) return 'ok';
+  }
+  if (isCollecting && !isCollecting()) return 'stopped';
+  return 'timeout';
 }
 
 // ============================================================
@@ -498,9 +582,13 @@ async function runSearchCollect(autoPaging) {
   panelErrors([]);
   var page = 1;
   var maxPages = 500;
+  var total = readPaginationTotal();
+  var totalPages = total.totalPages;
+  searchState.totalPages = totalPages || 0;
+  searchState.pagesCollected = 0;
   try {
     while (!searchState.stop) {
-      panelStatus('正在采集第 ' + page + ' 页…（已采 ' + searchState.rows.length + ' 条）');
+      panelStatus('正在采集第 ' + page + (totalPages ? ' / 共 ' + totalPages : '') + ' 页…（已采 ' + searchState.rows.length + ' 条）');
       var res = collectSearchPage();
       if (!res.ok) {
         searchState.errors = res.errors;
@@ -508,21 +596,31 @@ async function runSearchCollect(autoPaging) {
         panelStatus('已停：' + res.errors[0]);
         break;
       }
-      panelStatus('第 ' + page + ' 页完成，本页新增 ' + res.added + ' 条，总计 ' + searchState.rows.length + ' 条');
+      searchState.pagesCollected = page;
+      panelStatus('第 ' + page + (totalPages ? ' / 共 ' + totalPages : '') + ' 页完成，本页新增 ' + res.added + ' 条，总计 ' + searchState.rows.length + ' 条');
       if (!autoPaging) break;
+      if (totalPages && page >= totalPages) {
+        var more = findPageButton(page + 1) || findNextButton();
+        if (!more) break;
+        totalPages = null;
+        searchState.totalPages = 0;
+      }
       if (page >= maxPages) break;
       var found = findTableByFingerprint(fingerprintSearchTable);
       if (!found) { searchState.partial = true; searchState.partialReason = '翻页后找不到表格，已采的 ' + searchState.rows.length + ' 条保留。'; break; }
       var prevSig = rowSignature(found.table);
-      var nextBtn = findNextButton();
-      if (!nextBtn) break; // 末页：没有下一页按钮，正常结束
-      nextBtn.click();
-      var loaded = await waitForNewData(found.table, prevSig, function () { return !searchState.stop; });
-      if (!loaded) {
-        if (searchState.stop) break;
-        // 翻页失败：部分导出，不丢已采的行（旧脚本直接 abort 丢行的毛病不抄）。
+      var nav = await gotoPage(page + 1, prevSig, function () { return !searchState.stop; });
+      if (nav === 'stopped') break;
+      if (nav === 'no-button') {
+        if (totalPages && page < totalPages) {
+          searchState.partial = true;
+          searchState.partialReason = '找不到下一页按钮（共 ' + totalPages + ' 页，只采到第 ' + page + ' 页）。';
+        }
+        break;
+      }
+      if (nav === 'timeout') {
         searchState.partial = true;
-        searchState.partialReason = '第 ' + page + ' 页之后翻页超时（8 秒内行未变），已采的 ' + searchState.rows.length + ' 条保留，导出为部分数据。';
+        searchState.partialReason = '第 ' + page + ' 页之后翻不动了' + (totalPages ? '（共 ' + totalPages + ' 页）' : '') + '，已采的 ' + searchState.rows.length + ' 条保留，导出为部分数据。';
         break;
       }
       page++;
@@ -542,7 +640,7 @@ async function runSearchCollect(autoPaging) {
     partialReason: searchState.partialReason,
     errors: searchState.errors
   });
-  panelStatus('已导出 ' + file + '（' + searchState.rows.length + ' 条' + (searchState.partial ? '，部分数据' : '') + '）。');
+  panelStatus('已采 ' + searchState.pagesCollected + (totalPages ? ' / 共 ' + totalPages : '') + ' 页，' + searchState.rows.length + ' 条' + (searchState.partial ? '，部分数据：' + searchState.partialReason : '') + '，已导出 ' + file + '。');
 }
 
 function initSearchPanel() {
