@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.0.0
-// @description  在罗盘搜索词页 / 创作者中心视频页上点一下，把整页结构（表头、分页、总数、日期控件、按钮）导成一个 JSON 发给 Edison，一次看清，不再一个一个症状猜。
+// @version      1.0.1
+// @description  罗盘全站通用探针：在罗盘任意一页 / 创作者中心视频页上点一下，把整页结构（表头、分页、总数、日期控件、按钮）导成一个 JSON 发给 Edison，一页一个文件，文件名带页名。
 // @author       Edison
-// @match        https://compass.jinritemai.com/shop/search/drainage-terms
-// @match        https://fxg.jinritemai.com/ffa/mcompass/search*
+// @match        https://compass.jinritemai.com/shop/*
+// @match        https://fxg.jinritemai.com/ffa/mcompass/*
 // @match        https://creator.douyin.com/creator-micro/data-center/content
 // @grant        none
 // @run-at       document-idle
@@ -86,7 +86,8 @@
     var blob = new Blob(['\uFEFF' + JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'page-probe-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+    var pageSlug = location.pathname.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page';
+    a.download = 'page-probe-' + pageSlug + '-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
     document.body.appendChild(a);
     a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
