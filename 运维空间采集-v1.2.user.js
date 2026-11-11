@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.2.1
+// @version      1.2.2
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。v1.2：设置面板里填一次 VPS 地址+钥匙（存浏览器本地，随时能改），填了就先发 VPS，没填或发不出去自动改回本地下载。
@@ -170,6 +170,16 @@ function buildColumnMap(headers, spec) {
     var exactNorm = s.exact.replace(/\s+/g, '');
     for (var i = 0; i < norm.length; i++) {
       if (norm[i] === exactNorm) { idx = i; break; }
+    }
+    // 2026-11-11 实测：页面表头会改名（如“搜索词”改成“搜索词信息”），
+    // 先认新名，认不到再认旧名，两个都不认才报缺列停下。
+    if (idx === -1 && s.alts) {
+      for (var a = 0; a < s.alts.length && idx === -1; a++) {
+        var altNorm = s.alts[a].replace(/\s+/g, '');
+        for (var k = 0; k < norm.length; k++) {
+          if (norm[k] === altNorm) { idx = k; break; }
+        }
+      }
     }
     if (idx === -1 && s.allowIncludes) {
       for (var j = 0; j < norm.length; j++) {
@@ -499,7 +509,7 @@ async function waitForNewData(table, prevSig, isCollecting) {
 // ============================================================
 
 var SEARCH_SPEC = [
-  { key: 'search_term', exact: '搜索词', allowIncludes: false },
+  { key: 'search_term', exact: '搜索词信息', alts: ['搜索词'], allowIncludes: false },
   // 关键：商品曝光人数只认精确表头“商品曝光人数”。
   // “搜索结果曝光人数”是另一列（第 3 列），旧 v5 取第一个含“曝光人数”的列
   // 抓到的是搜索曝光，这版绝不能重犯。
@@ -507,8 +517,8 @@ var SEARCH_SPEC = [
   { key: 'search_people', exact: '搜索人数', allowIncludes: false },
   { key: 'search_payment_amount', exact: '搜索用户支付金额', allowIncludes: false },
   { key: 'product_exposure', exact: '商品曝光人数', allowIncludes: false },
-  { key: 'product_click_rate', exact: '商品点击率', allowIncludes: false },
-  { key: 'product_click_conversion_rate', exact: '商品点击-成交转化率', allowIncludes: false },
+  { key: 'product_click_rate', exact: '商品点击率(人数)', alts: ['商品点击率'], allowIncludes: false },
+  { key: 'product_click_conversion_rate', exact: '商品点击-成交转化率(人数)', alts: ['商品点击-成交转化率'], allowIncludes: false },
   { key: 'shop_exposed_products', exact: '词下本店曝光商品', allowIncludes: true },
   { key: 'hot_products', exact: '词下热门商品', allowIncludes: true }
 ];
