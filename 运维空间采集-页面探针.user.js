@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.7
+// @version      1.1.8
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -57,7 +57,7 @@
 
   function dump() {
     var out = {
-      tool: 'page-probe/1.1',
+      tool: 'page-probe/1.1.8',
       url: location.href,
       title: document.title,
       time: new Date().toISOString(),
@@ -174,19 +174,36 @@
   }
 
   // 等表出来再抓：很多页数据是异步加载的，3 秒不够就抓空。
-  // 每秒看一次，最多等 20 秒；实在没表也照常抓（记个空）。
+  // 2026-11-11 第二轮实测：空壳表也有 2 行（无表头、无文字），只看行数会提前抓空。
+  // 所以等的是“数据行里有真文字、且行数两次看一样”；5 秒了连 table 都没有，
+  // 说明这页本来就没表，不再空等；有表没数据最多等 20 秒。
   function waitForTables(done) {
     var waited = 0;
+    var lastCount = -1;
+    var stable = 0;
     var timer = setInterval(function () {
       waited += 1000;
-      var has = false;
+      var tableCount = 0;
+      var dataText = 0;
+      var rowCount = 0;
       try {
         var tbs = document.querySelectorAll('table');
+        tableCount = tbs.length;
         for (var i = 0; i < tbs.length; i++) {
-          if (tbs[i].querySelectorAll('tbody tr').length) { has = true; break; }
+          var rows = tbs[i].querySelectorAll('tbody tr');
+          rowCount += rows.length;
+          for (var j = 1; j < rows.length; j++) {
+            dataText += (rows[j].innerText || rows[j].textContent || '').replace(/\s+/g, '').length;
+          }
         }
       } catch (e) { /* 忽略 */ }
-      if (has || waited >= 20000) { clearInterval(timer); done(); }
+      if (tableCount === 0 && waited >= 5000) { clearInterval(timer); done(); return; }
+      if (dataText > 0) {
+        if (rowCount === lastCount) { stable++; } else { stable = 0; }
+        lastCount = rowCount;
+        if (stable >= 1) { clearInterval(timer); done(); return; }
+      }
+      if (waited >= 20000) { clearInterval(timer); done(); }
     }, 1000);
   }
 
@@ -213,7 +230,7 @@
     var all = storeGet(STORE_KEY, {});
     var pages = Object.keys(all).map(function (k) { return all[k]; });
     if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
-    downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.1', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
+    downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.1.8', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
     status('已导出全部结构：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
   }
 
