@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.0
-// @description  罗盘全站通用探针。平时你正常逛罗盘，它悄悄把每页结构记下来；点“一键扫全部页面”，它自己顺着菜单一页一页翻过去抓完；最后点“导出全部结构”，只下一个总文件。 structures 存浏览器本地，不发任何地方。
+// @version      1.1.1
+// @description  罗盘全站通用探针。平时你正常逛罗盘，它悄悄把每页结构记下来；点“一键扫全部页面”，它自己顺着顶上导航栏一页一页翻过去抓完；最后点“导出全部结构”，只下一个总文件。每页都把导航栏原样记下来，不再猜导航长什么样。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
 // @match        https://fxg.jinritemai.com/ffa/mcompass/*
@@ -48,6 +48,7 @@
       tables: [],
       pagination: {},
       navPages: [],
+      navBar: {},
       dateControls: [],
       buttons: [],
       totalsText: []
@@ -70,6 +71,28 @@
       out.pagination.items = Array.from(pag.querySelectorAll('button, li, a, span')).map(elInfo);
     } else {
       out.pagination.found = false;
+    }
+
+    // 顶上导航栏本身：样子 + 每一项的名字（不管它是链接还是点一下跳转的）。
+    // 以前老地图没记导航栏长什么样，这次每页都记下来，以后不再猜。
+    var navBar = null;
+    var navCands = document.querySelectorAll('header, nav, [class*="header"], [class*="top-bar"], [class*="topbar"], [class*="nav-bar"], [class*="navbar"], [class*="menu"]');
+    for (var ni = 0; ni < navCands.length && !navBar; ni++) {
+      var cand = navCands[ni];
+      var ct = clean(cand.innerText || cand.textContent || '');
+      if (ct.length > 10) navBar = cand;
+    }
+    if (navBar) {
+      out.navBar.html = navBar.outerHTML.slice(0, 6000);
+      out.navBar.items = [];
+      var seenNav = {};
+      Array.from(navBar.querySelectorAll('a, button, li, [role="menuitem"], [role="tab"]')).forEach(function (el) {
+        var t = clean(el.innerText || el.textContent || '');
+        if (!t || t.length > 20 || seenNav[t]) return;
+        seenNav[t] = true;
+        var href = (el.getAttribute && el.getAttribute('href')) || '';
+        out.navBar.items.push({ text: t, href: href, tag: el.tagName.toLowerCase() });
+      });
     }
 
     var seenHref = {};
@@ -141,7 +164,14 @@
   function startWalk() {
     var d = dump();
     var queue = d.navPages.filter(function (p) { return p.href.indexOf(location.origin) === 0; });
-    if (!queue.length) { status('这页没找到菜单，先打开罗盘里带左边菜单的页面再点。'); return; }
+    if (!queue.length) {
+      // 导航栏里的项不是链接（点一下跳转的那种），翻页队排不出来。
+      // 先把这页结构（含导航栏原样）记下来，发我看一眼再改，不硬猜。
+      savePage(d);
+      status('这页导航栏里的项不是链接，自动翻页排不出来。已把这页结构记下来了，点“导出全部结构”发我，我看一眼导航栏到底长什么样再改。');
+      refreshPanel();
+      return;
+    }
     // 当前页先算进去，队列里去掉当前页
     savePage(d);
     queue = queue.filter(function (p) { return p.href.split('#')[0] !== location.href.split('#')[0]; });
