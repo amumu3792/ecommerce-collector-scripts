@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.6
+// @version      1.1.7
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -20,12 +20,13 @@
   var WALK_KEY = 'spaceImport.probe.walk.v1';
   var SUBMENU_KEY = 'spaceImport.probe.submenus.v1';
   var PACE_KEY = 'spaceImport.probe.pace.v1';
-  // 真人节奏：每页停留 8~20 秒再走（默认慢速），间隔随机，不机械。
+  // 真人节奏：每页停留 15~30 秒再走（默认慢速），间隔随机，不机械。
   // 平台反爬看的就是短时间内连续请求，宁可慢，不能快到报“请求太快”影响账号。
+  // 2026-11-11 实测：65 页里 53 页抓空，就是翻得太快、表还没出来就抓了。
   function paceSlow() { return storeGet(PACE_KEY, 'slow') !== 'fast'; }
   function humanDelay() {
-    if (paceSlow()) return 8000 + Math.random() * 12000;
-    return 4000 + Math.random() * 4000;
+    if (paceSlow()) return 15000 + Math.random() * 15000;
+    return 8000 + Math.random() * 7000;
   }
   function hoverDelay() {
     if (paceSlow()) return 900 + Math.random() * 700;
@@ -173,7 +174,7 @@
   }
 
   // 等表出来再抓：很多页数据是异步加载的，3 秒不够就抓空。
-  // 每秒看一次，最多等 15 秒；实在没表也照常抓（记个空）。
+  // 每秒看一次，最多等 20 秒；实在没表也照常抓（记个空）。
   function waitForTables(done) {
     var waited = 0;
     var timer = setInterval(function () {
@@ -185,7 +186,7 @@
           if (tbs[i].querySelectorAll('tbody tr').length) { has = true; break; }
         }
       } catch (e) { /* 忽略 */ }
-      if (has || waited >= 15000) { clearInterval(timer); done(); }
+      if (has || waited >= 20000) { clearInterval(timer); done(); }
     }, 1000);
   }
 
@@ -277,13 +278,16 @@
   // 队里两种活：{kind:'url'} 按地址跳页；{kind:'click'} 点左菜单项。
   // 每到一页先抓结构，再把这页左菜单里没走过的项（跳过带锁的）排进队，
   // 本模块的点完再跳下一个顶栏页。
-  function startWalk() {
+  function startWalk() { startWalkMode(false); }
+  function startWalkEmpty() { startWalkMode(true); }
+  function pathOf(href) { try { return new URL(href).pathname; } catch (e) { return href.split('?')[0]; } }
+  function startWalkMode(onlyEmpty) {
     var stored = storeGet(SUBMENU_KEY, []);
-    if (stored.length) { status('下拉子页面之前已认过，直接开始扫…'); startWalkGo(); return; }
+    if (stored.length) { status('下拉子页面之前已认过，直接开始扫…'); startWalkGo(onlyEmpty); return; }
     status('先把顶栏每一项的下拉子页面认一遍…');
-    collectSubmenus(function () { startWalkGo(); });
+    collectSubmenus(function () { startWalkGo(onlyEmpty); });
   }
-  function startWalkGo() {
+  function startWalkGo(onlyEmpty) {
       var d = dump();
       savePage(d);
       var queue = [];
@@ -299,6 +303,19 @@
         if (p.href.split('#')[0].split('?')[0] === location.href.split('#')[0].split('?')[0]) return;
         queue.push({ kind: 'url', href: p.href, name: p.name });
       });
+      if (onlyEmpty) {
+        // 只补空页：已经抓到表的页不再走；总览页本来就没表，抓回来还是空，不用反复补。
+        var all = storeGet(STORE_KEY, {});
+        var hasTable = {};
+        Object.keys(all).forEach(function (u) {
+          if ((all[u].tables || []).length) hasTable[pathOf(u)] = true;
+        });
+        queue = queue.filter(function (e) {
+          if (e.kind !== 'url') return true;
+          return !hasTable[pathOf(e.href)];
+        });
+        if (!queue.length) { status('空页都补完了，没有需要再走的页。'); refreshPanel(); return; }
+      }
       if (!queue.length) {
         status('这页没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
         refreshPanel();
@@ -391,6 +408,8 @@
     if (stopBtn) stopBtn.style.display = walk ? 'inline-block' : 'none';
     var walkBtn = document.getElementById('sip-probe-walk');
     if (walkBtn) walkBtn.style.display = walk ? 'none' : 'inline-block';
+    var emptyBtn = document.getElementById('sip-probe-empty');
+    if (emptyBtn) emptyBtn.style.display = walk ? 'none' : 'inline-block';
   }
 
   function init() {
@@ -402,6 +421,7 @@
       + '<div id="sip-probe-count" style="color:#cbd5e1;margin-bottom:8px;">已收录 0 页</div>'
       + '<div style="margin-bottom:8px;">'
       + '<button id="sip-probe-walk" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">一键扫全部页面</button>'
+      + '<button id="sip-probe-empty" style="background:#7c3aed;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">只补空页</button>'
       + '<button id="sip-probe-stop" style="background:#dc2626;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;display:none;">停止</button>'
       + '<button id="sip-probe-all" style="background:#059669;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">导出全部结构</button>'
       + '</div>'
@@ -415,9 +435,10 @@
     paceBtn.onclick = function () {
       storeSet(PACE_KEY, paceSlow() ? 'fast' : 'slow');
       paceBtn.textContent = paceSlow() ? '速度：慢（稳妥）' : '速度：较快';
-      status(paceSlow() ? '已切到慢速：每页停 8~20 秒再走。' : '已切到较快：每页停 4~8 秒。还是建议用慢速。');
+      status(paceSlow() ? '已切到慢速：每页停 15~30 秒再走。' : '已切到较快：每页停 8~15 秒。还是建议用慢速。');
     };
     document.getElementById('sip-probe-walk').onclick = startWalk;
+    document.getElementById('sip-probe-empty').onclick = startWalkEmpty;
     document.getElementById('sip-probe-stop').onclick = stopWalk;
     document.getElementById('sip-probe-all').onclick = exportAll;
     document.getElementById('sip-probe-one').onclick = exportThisPage;
