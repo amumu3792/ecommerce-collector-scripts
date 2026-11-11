@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.2
-// @description  罗盘全站通用探针。顶栏每项是带 data-subway-href 的 div（不是链接），探针按这个认页面；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
+// @version      1.1.3
+// @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
 // @match        https://fxg.jinritemai.com/ffa/mcompass/*
@@ -50,6 +50,7 @@
       pagination: {},
       navPages: [],
       navBar: {},
+      leftMenu: { title: '', items: [] },
       dateControls: [],
       buttons: [],
       totalsText: []
@@ -118,6 +119,26 @@
       if (href.indexOf('/shop/') === -1 && href.indexOf('compass.jinritemai.com') === -1) return;
       addNavPage(a.innerText || a.textContent, href, '');
     });
+
+    // 左侧导航栏（每个模块里各有一排）：项是 div[data-left-menu-id]，没有地址，
+    // 只能点一下跳过去；带锁的（.icon-Crx3Tu 里有锁形图标）是受限功能。
+    var leftBox = document.querySelector('[data-marker-key="left-menu-container"]');
+    if (leftBox) {
+      var lt = leftBox.querySelector('.titleText-C31cAR');
+      out.leftMenu.title = lt ? clean(lt.innerText || lt.textContent) : '';
+      Array.from(leftBox.querySelectorAll('[data-left-menu-id]')).forEach(function (el) {
+        var label = el.querySelector('.menuLabel-_yn12A');
+        var name = clean((label ? label.innerText || label.textContent : el.innerText || el.textContent) || '');
+        var locked = !!el.querySelector('.icon-Crx3Tu');
+        var cls = (el.className && typeof el.className === 'string') ? el.className : '';
+        out.leftMenu.items.push({
+          id: el.getAttribute('data-left-menu-id'),
+          name: name,
+          active: cls.indexOf('active') !== -1,
+          locked: locked
+        });
+      });
+    }
 
     var bodyText = clean(document.body.innerText || document.body.textContent || '');
     var re = /共\s*\d+\s*[条页]|总数[^0-9]{0,5}\d+|\d+\s*\/\s*\d+/g;
@@ -213,24 +234,44 @@
     step();
   }
 
-  // ---- 一键扫全部：顺着顶上导航栏自己翻页，扫完只下一个总文件 ----
+  // 页面签名：地址 + 表行数 + 首行，用来判断点一下之后页面变了没有。
+  function pageSig() {
+    var tb = document.querySelector('table');
+    var rows = tb ? tb.querySelectorAll('tbody tr') : [];
+    var first = rows.length ? clean(rows[0].innerText || rows[0].textContent).slice(0, 60) : '';
+    return location.href + '|' + rows.length + '|' + first;
+  }
+
+  // ---- 一键扫全部：顶栏页按地址跳，左菜单项点一下跳 ----
+  // 队里两种活：{kind:'url'} 按地址跳页；{kind:'click'} 点左菜单项。
+  // 每到一页先抓结构，再把这页左菜单里没走过的项（跳过带锁的）排进队，
+  // 本模块的点完再跳下一个顶栏页。
   function startWalk() {
     status('先把顶栏每一项的下拉子页面认一遍…');
     collectSubmenus(function () {
       var d = dump();
-      var queue = d.navPages.filter(function (p) { return p.href.indexOf(location.origin) === 0; });
+      savePage(d);
+      var queue = [];
+      var queuedLeft0 = {};
+      (d.leftMenu.items || []).forEach(function (it) {
+        if (!it.locked && !it.active) {
+          queuedLeft0[it.id] = true;
+          queue.push({ kind: 'click', leftMenuId: it.id, name: it.name, parent: d.leftMenu.title || '' });
+        }
+      });
+      d.navPages.forEach(function (p) {
+        if (p.href.indexOf(location.origin) !== 0) return;
+        if (p.href.split('#')[0].split('?')[0] === location.href.split('#')[0].split('?')[0]) return;
+        queue.push({ kind: 'url', href: p.href, name: p.name });
+      });
       if (!queue.length) {
-        savePage(d);
-        status('顶栏里没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
+        status('这页没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
         refreshPanel();
         return;
       }
-      // 当前页先算进去，队列里去掉当前页
-      savePage(d);
-      queue = queue.filter(function (p) { return p.href.split('#')[0].split('?')[0] !== location.href.split('#')[0].split('?')[0]; });
-      storeSet(WALK_KEY, { queue: queue, index: 0, total: queue.length + 1, startedAt: new Date().toISOString() });
-      status('开始扫全部页面，共 ' + (queue.length + 1) + ' 页，正在去第 2 页…');
-      setTimeout(function () { location.href = queue[0].href; }, 800);
+      storeSet(WALK_KEY, { queue: queue, index: 0, queuedLeft: queuedLeft0, doneLeft: {}, startedAt: new Date().toISOString() });
+      status('开始扫全部页面，正在去：' + (queue[0].name || '') + '…');
+      setTimeout(function () { walkTakeNext(); }, 800);
     });
   }
 
@@ -240,22 +281,63 @@
     refreshPanel();
   }
 
-  function walkStep() {
+  function walkFinish() {
+    var all = storeGet(STORE_KEY, {});
+    storeDel(WALK_KEY);
+    status('全部扫完：共收录 ' + Object.keys(all).length + ' 页，正在下一个总文件…');
+    setTimeout(exportAll, 600);
+    refreshPanel();
+  }
+
+  // 走队里下一个。点左菜单项时等页面变了（地址或表内容变）再继续；
+  // 整页刷新了就由新页面加载后接着走，不会重复。
+  function walkTakeNext() {
     var walk = storeGet(WALK_KEY, null);
-    if (!walk || !walk.queue || !walk.queue.length) return false;
-    var n = savePage(dump());
-    var next = walk.index + 1;
-    if (next >= walk.queue.length) {
-      storeDel(WALK_KEY);
-      status('全部扫完：共 ' + walk.total + ' 页，正在下一个总文件…');
-      setTimeout(exportAll, 600);
-      return true;
-    }
-    walk.index = next;
+    if (!walk) return;
+    var d = dump();
+    var n = savePage(d);
+    refreshPanel();
+    (d.leftMenu.items || []).forEach(function (it) {
+      if (it.locked || it.active) return;
+      if (walk.queuedLeft[it.id] || walk.doneLeft[it.id]) return;
+      walk.queuedLeft[it.id] = true;
+      walk.queue.push({ kind: 'click', leftMenuId: it.id, name: it.name, parent: d.leftMenu.title || '' });
+    });
     storeSet(WALK_KEY, walk);
-    status('正在扫第 ' + (next + 1) + ' / 共 ' + walk.total + ' 页：' + (walk.queue[next].name || '') + '（已收录 ' + n + ' 页）');
-    setTimeout(function () { location.href = walk.queue[next].href; }, 1200);
-    return true;
+    while (walk.index < walk.queue.length) {
+      var next = walk.queue[walk.index];
+      walk.index++;
+      storeSet(WALK_KEY, walk);
+      if (next.kind === 'url') {
+        status('正在去：' + (next.name || next.href) + '（已收录 ' + n + ' 页）');
+        setTimeout(function () { location.href = next.href; }, 600);
+        return;
+      }
+      // click 项：只在本模块的页面上点得到，找不到了就跳过。
+      var el = document.querySelector('[data-left-menu-id="' + next.leftMenuId + '"]');
+      if (!el) continue;
+      if (walk.doneLeft[next.leftMenuId]) continue;
+      walk.doneLeft[next.leftMenuId] = true;
+      storeSet(WALK_KEY, walk);
+      status('正在扫：' + (next.parent ? next.parent + ' / ' : '') + next.name + '（已收录 ' + n + ' 页）');
+      var prevSig = pageSig();
+      var prevUrl = location.href;
+      try { el.click(); } catch (e) { /* 忽略 */ }
+      var waited = 0;
+      var timer = setInterval(function () {
+        waited += 500;
+        if (location.href !== prevUrl || pageSig() !== prevSig || waited >= 10000) {
+          clearInterval(timer);
+          setTimeout(walkTakeNext, 2500);
+        }
+      }, 500);
+      return;
+    }
+    walkFinish();
+  }
+
+  function walkStep() {
+    walkTakeNext();
   }
 
   function status(msg) {
