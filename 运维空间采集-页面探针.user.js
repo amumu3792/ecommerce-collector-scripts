@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.4
+// @version      1.1.5
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
-// @match        https://compass.jinritemai.com/shop/*
-// @match        https://fxg.jinritemai.com/ffa/mcompass/*
+// @match        https://compass.jinritemai.com/*
+// @match        https://fxg.jinritemai.com/*
 // @match        https://creator.douyin.com/creator-micro/data-center/content
+// @updateURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-%E9%A1%B5%E9%9D%A2%E6%8E%A2%E9%92%88.user.js
+// @downloadURL  https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-%E9%A1%B5%E9%9D%A2%E6%8E%A2%E9%92%88.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
