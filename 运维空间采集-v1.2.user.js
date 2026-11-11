@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.2.4
+// @version      1.2.5
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。v1.2：设置面板里填一次 VPS 地址+钥匙（存浏览器本地，随时能改），填了就先发 VPS，没填或发不出去自动改回本地下载。
@@ -779,6 +779,9 @@ async function runSearchCollect(autoPaging) {
       var found = findTableByFingerprint(fingerprintSearchTable);
       if (!found) { searchState.partial = true; searchState.partialReason = '翻页后找不到表格，已采的 ' + searchState.rows.length + ' 条保留。'; break; }
       var prevSig = rowSignature(found.table);
+      // 真人节奏：翻页前停 3~7 秒（随机），别像机器一样一页接一页点，
+      // 平台反爬看的就是短时间内连续请求。
+      await sleep(3000 + Math.random() * 4000);
       var nav = await gotoPage(page + 1, prevSig, function () { return !searchState.stop; });
       if (nav === 'stopped') break;
       if (nav === 'no-button') {

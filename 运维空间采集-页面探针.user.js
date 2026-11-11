@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.3
+// @version      1.1.4
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
@@ -17,6 +17,18 @@
   var STORE_KEY = 'spaceImport.probe.pages.v1';
   var WALK_KEY = 'spaceImport.probe.walk.v1';
   var SUBMENU_KEY = 'spaceImport.probe.submenus.v1';
+  var PACE_KEY = 'spaceImport.probe.pace.v1';
+  // 真人节奏：每页停留 8~20 秒再走（默认慢速），间隔随机，不机械。
+  // 平台反爬看的就是短时间内连续请求，宁可慢，不能快到报“请求太快”影响账号。
+  function paceSlow() { return storeGet(PACE_KEY, 'slow') !== 'fast'; }
+  function humanDelay() {
+    if (paceSlow()) return 8000 + Math.random() * 12000;
+    return 4000 + Math.random() * 4000;
+  }
+  function hoverDelay() {
+    if (paceSlow()) return 900 + Math.random() * 700;
+    return 500 + Math.random() * 300;
+  }
 
   function clean(s) { return String(s == null ? '' : s).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(); }
 
@@ -229,7 +241,7 @@
         });
         i++;
         step();
-      }, 500);
+      }, hoverDelay());
     }
     step();
   }
@@ -247,8 +259,12 @@
   // 每到一页先抓结构，再把这页左菜单里没走过的项（跳过带锁的）排进队，
   // 本模块的点完再跳下一个顶栏页。
   function startWalk() {
+    var stored = storeGet(SUBMENU_KEY, []);
+    if (stored.length) { status('下拉子页面之前已认过，直接开始扫…'); startWalkGo(); return; }
     status('先把顶栏每一项的下拉子页面认一遍…');
-    collectSubmenus(function () {
+    collectSubmenus(function () { startWalkGo(); });
+  }
+  function startWalkGo() {
       var d = dump();
       savePage(d);
       var queue = [];
@@ -272,7 +288,6 @@
       storeSet(WALK_KEY, { queue: queue, index: 0, queuedLeft: queuedLeft0, doneLeft: {}, startedAt: new Date().toISOString() });
       status('开始扫全部页面，正在去：' + (queue[0].name || '') + '…');
       setTimeout(function () { walkTakeNext(); }, 800);
-    });
   }
 
   function stopWalk() {
@@ -310,7 +325,7 @@
       storeSet(WALK_KEY, walk);
       if (next.kind === 'url') {
         status('正在去：' + (next.name || next.href) + '（已收录 ' + n + ' 页）');
-        setTimeout(function () { location.href = next.href; }, 600);
+        setTimeout(function () { location.href = next.href; }, humanDelay());
         return;
       }
       // click 项：只在本模块的页面上点得到，找不到了就跳过。
@@ -328,7 +343,7 @@
         waited += 500;
         if (location.href !== prevUrl || pageSig() !== prevSig || waited >= 10000) {
           clearInterval(timer);
-          setTimeout(walkTakeNext, 2500);
+          setTimeout(walkTakeNext, humanDelay());
         }
       }, 500);
       return;
@@ -368,10 +383,18 @@
       + '<button id="sip-probe-stop" style="background:#dc2626;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;display:none;">停止</button>'
       + '<button id="sip-probe-all" style="background:#059669;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">导出全部结构</button>'
       + '</div>'
+      + '<div style="margin-bottom:8px;"><button id="sip-probe-pace" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">速度：慢（稳妥）</button></div>'
       + '<div><button id="sip-probe-one" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">只导出本页</button>'
       + '<button id="sip-probe-clear" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;margin-left:6px;">清空已收录</button></div>'
       + '<div id="sip-probe-status" style="margin-top:8px;color:#94a3b8;"></div>';
     document.body.appendChild(div);
+    var paceBtn = document.getElementById('sip-probe-pace');
+    paceBtn.textContent = paceSlow() ? '速度：慢（稳妥）' : '速度：较快';
+    paceBtn.onclick = function () {
+      storeSet(PACE_KEY, paceSlow() ? 'fast' : 'slow');
+      paceBtn.textContent = paceSlow() ? '速度：慢（稳妥）' : '速度：较快';
+      status(paceSlow() ? '已切到慢速：每页停 8~20 秒再走。' : '已切到较快：每页停 4~8 秒。还是建议用慢速。');
+    };
     document.getElementById('sip-probe-walk').onclick = startWalk;
     document.getElementById('sip-probe-stop').onclick = stopWalk;
     document.getElementById('sip-probe-all').onclick = exportAll;
@@ -394,7 +417,7 @@
         var n = savePage(dump());
         var countEl = document.getElementById('sip-probe-count');
         if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
-        collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
+        if (!storeGet(SUBMENU_KEY, []).length) collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
       }
     }, 3000);
   }
