@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.0.1
-// @description  罗盘全站通用探针：在罗盘任意一页 / 创作者中心视频页上点一下，把整页结构（表头、分页、总数、日期控件、按钮）导成一个 JSON 发给 Edison，一页一个文件，文件名带页名。
+// @version      1.0.2
+// @description  罗盘全站通用探针：在罗盘任意一页点一下，导出那页的表头、分页、总数、日期控件、按钮，外加左边菜单里的全部页面清单（一页一个文件，文件名带页名）。
 // @author       Edison
 // @match        https://compass.jinritemai.com/shop/*
 // @match        https://fxg.jinritemai.com/ffa/mcompass/*
@@ -34,6 +34,7 @@
       time: new Date().toISOString(),
       tables: [],
       pagination: {},
+      navPages: [],
       dateControls: [],
       buttons: [],
       totalsText: []
@@ -59,6 +60,20 @@
     } else {
       out.pagination.found = false;
     }
+
+    // 左边菜单里的全部页面清单：罗盘站内链接去重，名字 + 地址都有。
+    // 在任意一页点一下就能拿到整站目录，不用一页一页翻。
+    var seenHref = {};
+    Array.from(document.querySelectorAll('a[href]')).forEach(function (a) {
+      var href = a.getAttribute('href') || '';
+      if (href.indexOf('/shop/') === -1 && href.indexOf('compass.jinritemai.com') === -1) return;
+      var full = href.indexOf('http') === 0 ? href : location.origin + href;
+      if (seenHref[full]) return;
+      var t = clean(a.innerText || a.textContent || '');
+      if (!t) return;
+      seenHref[full] = true;
+      out.navPages.push({ name: t.slice(0, 40), href: full });
+    });
 
     // 全页找“共 N 条 / 共 N 页 / x / y”这类总数文字
     var bodyText = clean(document.body.innerText || document.body.textContent || '');
