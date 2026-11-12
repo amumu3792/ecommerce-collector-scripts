@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集-深度探针
 // @namespace    https://workspace/operations-space
-// @version      1.1.1
+// @version      1.1.2
 // @description  深度探针：拦截页面接口返回 + 抓非表结构。只读，不发任何额外请求；正文跨页缓存，一次导出全有。
 // @match        https://compass.jinritemai.com/*
 // @match        https://fxg.jinritemai.com/*
@@ -326,7 +326,20 @@
       var nPages = Object.keys(byPage).length;
       var nBodies = 0;
       Object.keys(byPage).forEach(function (p) { nBodies += Object.keys(byPage[p].bodies).length; });
-      downloadFile('deep-probe-all-' + stamp() + '.json', { tool: 'deep-probe/1.1.1', time: new Date().toISOString(), frame: FRAME, pages: storeGet(PAGE_KEY, {}), byPage: byPage });
+      // 导出前把摘要里的链接再洗一遍：旧版（v1.1.0 之前）存在本地的摘要还带着登录 token，
+      // 不洗就跟着导出来了。新记的调用本身已洗过，这里只洗旧摘要。
+      var pagesRaw = storeGet(PAGE_KEY, {});
+      var pages = {};
+      Object.keys(pagesRaw).forEach(function (u) {
+        var sm = pagesRaw[u] || {};
+        pages[cleanUrl(u)] = {
+          time: sm.time, frame: sm.frame, apiCount: sm.apiCount,
+          apis: (sm.apis || []).map(function (a) {
+            return String(a).replace(/\S+:\/\/\S+/, function (m) { return cleanUrl(m); });
+          })
+        };
+      });
+      downloadFile('deep-probe-all-' + stamp() + '.json', { tool: 'deep-probe/1.1.2', time: new Date().toISOString(), frame: FRAME, pages: pages, byPage: byPage });
       status('已导出全部缓存：' + nPages + ' 页、' + nBodies + ' 个接口正文。发我。');
     });
   }
@@ -395,7 +408,7 @@
     document.getElementById('sip-dp-export-all').onclick = exportAll;
     document.getElementById('sip-dp-dump').onclick = function () {
       var d = deepDump();
-      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.1.1', dump: d });
+      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.1.2', dump: d });
       status('深结构已导出：表 ' + d.tables.length + ' 张、重复结构 ' + d.lists.length + ' 处、iframe ' + d.iframes.length + ' 个。发我。');
     };
     document.getElementById('sip-dp-clear').onclick = function () {
