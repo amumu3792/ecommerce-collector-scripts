@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集-深度探针
 // @namespace    https://workspace/operations-space
-// @version      1.1.0
+// @version      1.1.1
 // @description  深度探针：拦截页面接口返回 + 抓非表结构。只读，不发任何额外请求；正文跨页缓存，一次导出全有。
 // @match        https://compass.jinritemai.com/*
 // @match        https://fxg.jinritemai.com/*
@@ -326,7 +326,7 @@
       var nPages = Object.keys(byPage).length;
       var nBodies = 0;
       Object.keys(byPage).forEach(function (p) { nBodies += Object.keys(byPage[p].bodies).length; });
-      downloadFile('deep-probe-all-' + stamp() + '.json', { tool: 'deep-probe/1.1.0', time: new Date().toISOString(), frame: FRAME, pages: storeGet(PAGE_KEY, {}), byPage: byPage });
+      downloadFile('deep-probe-all-' + stamp() + '.json', { tool: 'deep-probe/1.1.1', time: new Date().toISOString(), frame: FRAME, pages: storeGet(PAGE_KEY, {}), byPage: byPage });
       status('已导出全部缓存：' + nPages + ' 页、' + nBodies + ' 个接口正文。发我。');
     });
   }
@@ -335,21 +335,67 @@
     var box = document.createElement('div');
     box.id = 'sip-deepprobe-panel';
     box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:999999;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:380px;';
-    box.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">深度探针 <span style="font-weight:400;color:#94a3b8;">v1.1.0 · 只读拦截 · ' + FRAME + '</span></div>'
+    box.innerHTML = '<div id="sip-dp-head" style="display:flex;align-items:center;cursor:move;user-select:none;margin-bottom:4px;">'
+      + '<span style="font-weight:700;flex:1;">深度探针 <span style="font-weight:400;color:#94a3b8;">v1.1.1 · 只读拦截 · ' + FRAME + '</span></span>'
+      + '<button id="sip-dp-min" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:1px 8px;cursor:pointer;font-size:14px;line-height:1.4;">—</button>'
+      + '</div>'
+      + '<div id="sip-dp-body">'
       + '<div id="sip-dp-count" style="color:#7dd3fc;">本页接口：0 个</div>'
       + '<div style="margin-top:8px;">'
       + '<button id="sip-dp-export-all" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">导出全部缓存</button>'
       + '<button id="sip-dp-dump" style="background:#059669;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">抓本页深结构</button>'
       + '<button id="sip-dp-clear" style="background:#475569;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">清空缓存</button>'
       + '</div>'
-      + '<div id="sip-dp-status" style="color:#fbbf24;margin-top:6px;min-height:18px;">逛完要看的页，点“导出全部缓存”一次发我。</div>';
+      + '<div id="sip-dp-status" style="color:#fbbf24;margin-top:6px;min-height:18px;">逛完要看的页，点“导出全部缓存”一次发我。</div>'
+      + '</div>';
     document.body.appendChild(box);
+    // 面板可缩小、可拖拽（2026-11-12 lin：面板挡住翻页按钮没法挪）
+    (function () {
+      var minKey = 'spaceImport.deepProbe.panelMin.v1';
+      var posKey = 'spaceImport.deepProbe.panelPos.v1';
+      var body = document.getElementById('sip-dp-body');
+      var minBtn = document.getElementById('sip-dp-min');
+      var head = document.getElementById('sip-dp-head');
+      function applyMin(m) {
+        body.style.display = m ? 'none' : 'block';
+        minBtn.textContent = m ? '+' : '—';
+        try { localStorage.setItem(minKey, m ? '1' : '0'); } catch (e) {}
+      }
+      minBtn.onclick = function () { applyMin(body.style.display !== 'none'); };
+      try { if (localStorage.getItem(minKey) === '1') applyMin(true); } catch (e) {}
+      try {
+        var pos = JSON.parse(localStorage.getItem(posKey) || 'null');
+        if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+          box.style.left = pos.left + 'px'; box.style.top = pos.top + 'px'; box.style.bottom = 'auto';
+        }
+      } catch (e) {}
+      head.addEventListener('mousedown', function (e) {
+        if (e.target === minBtn) return;
+        var sx = e.clientX, sy = e.clientY;
+        var r = box.getBoundingClientRect();
+        var dx = sx - r.left, dy = sy - r.top;
+        function move(ev) {
+          var nx = Math.max(0, Math.min(window.innerWidth - 60, ev.clientX - dx));
+          var ny = Math.max(0, Math.min(window.innerHeight - 40, ev.clientY - dy));
+          box.style.left = nx + 'px'; box.style.top = ny + 'px'; box.style.bottom = 'auto';
+        }
+        function up(ev) {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+          move(ev);
+          try { localStorage.setItem(posKey, JSON.stringify({ left: parseInt(box.style.left, 10), top: parseInt(box.style.top, 10) })); } catch (e) {}
+        }
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+        e.preventDefault();
+      });
+    })();
     statusEl = document.getElementById('sip-dp-status');
     countEl = document.getElementById('sip-dp-count');
     document.getElementById('sip-dp-export-all').onclick = exportAll;
     document.getElementById('sip-dp-dump').onclick = function () {
       var d = deepDump();
-      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.1.0', dump: d });
+      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.1.1', dump: d });
       status('深结构已导出：表 ' + d.tables.length + ' 张、重复结构 ' + d.lists.length + ' 处、iframe ' + d.iframes.length + ' 个。发我。');
     };
     document.getElementById('sip-dp-clear').onclick = function () {

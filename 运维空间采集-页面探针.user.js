@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.8
+// @version      1.1.9
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -433,8 +433,12 @@
     if (document.getElementById('sip-probe-panel')) return;
     var div = document.createElement('div');
     div.id = 'sip-probe-panel';
-    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:12px 14px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
-    div.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">页面探针</div>'
+    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
+    div.innerHTML = '<div id="sip-probe-head" style="display:flex;align-items:center;cursor:move;user-select:none;margin-bottom:4px;">'
+      + '<span style="font-weight:700;flex:1;">页面探针</span>'
+      + '<button id="sip-probe-min" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:1px 8px;cursor:pointer;font-size:14px;line-height:1.4;">—</button>'
+      + '</div>'
+      + '<div id="sip-probe-body">'
       + '<div id="sip-probe-count" style="color:#cbd5e1;margin-bottom:8px;">已收录 0 页</div>'
       + '<div style="margin-bottom:8px;">'
       + '<button id="sip-probe-walk" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">一键扫全部页面</button>'
@@ -445,8 +449,53 @@
       + '<div style="margin-bottom:8px;"><button id="sip-probe-pace" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">速度：慢（稳妥）</button></div>'
       + '<div><button id="sip-probe-one" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">只导出本页</button>'
       + '<button id="sip-probe-clear" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;margin-left:6px;">清空已收录</button></div>'
-      + '<div id="sip-probe-status" style="margin-top:8px;color:#94a3b8;"></div>';
+      + '<div id="sip-probe-status" style="margin-top:8px;color:#94a3b8;"></div>'
+      + '</div>';
     document.body.appendChild(div);
+    // 面板可缩小、可拖拽（2026-11-12 lin：面板挡住翻页按钮没法挪）
+    // 位置和缩小状态存在浏览器本地，换页还在。
+    (function () {
+      var minKey = 'spaceImport.probe.panelMin.v1';
+      var posKey = 'spaceImport.probe.panelPos.v1';
+      var body = document.getElementById('sip-probe-body');
+      var minBtn = document.getElementById('sip-probe-min');
+      var head = document.getElementById('sip-probe-head');
+      function applyMin(m) {
+        body.style.display = m ? 'none' : 'block';
+        minBtn.textContent = m ? '+' : '—';
+        try { localStorage.setItem(minKey, m ? '1' : '0'); } catch (e) {}
+      }
+      minBtn.onclick = function () { applyMin(body.style.display !== 'none'); };
+      try { if (localStorage.getItem(minKey) === '1') applyMin(true); } catch (e) {}
+      try {
+        var pos = JSON.parse(localStorage.getItem(posKey) || 'null');
+        if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+          div.style.right = 'auto'; div.style.bottom = 'auto';
+          div.style.left = pos.left + 'px'; div.style.top = pos.top + 'px';
+        }
+      } catch (e) {}
+      head.addEventListener('mousedown', function (e) {
+        if (e.target === minBtn) return;
+        var sx = e.clientX, sy = e.clientY;
+        var r = div.getBoundingClientRect();
+        var dx = sx - r.left, dy = sy - r.top;
+        function move(ev) {
+          var nx = Math.max(0, Math.min(window.innerWidth - 60, ev.clientX - dx));
+          var ny = Math.max(0, Math.min(window.innerHeight - 40, ev.clientY - dy));
+          div.style.right = 'auto'; div.style.bottom = 'auto';
+          div.style.left = nx + 'px'; div.style.top = ny + 'px';
+        }
+        function up(ev) {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+          move(ev);
+          try { localStorage.setItem(posKey, JSON.stringify({ left: parseInt(div.style.left, 10), top: parseInt(div.style.top, 10) })); } catch (e) {}
+        }
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+        e.preventDefault();
+      });
+    })();
     var paceBtn = document.getElementById('sip-probe-pace');
     paceBtn.textContent = paceSlow() ? '速度：慢（稳妥）' : '速度：较快';
     paceBtn.onclick = function () {
