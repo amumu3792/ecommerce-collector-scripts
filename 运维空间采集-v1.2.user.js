@@ -1,13 +1,16 @@
 // ==UserScript==
-// @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频）
+// @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频 + 罗盘视频/短视频榜）
 // @namespace    https://workspace/operations-space
-// @version      1.2.7
+// @version      1.2.8
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
-// @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。v1.2：设置面板里填一次 VPS 地址+钥匙（存浏览器本地，随时能改），填了就先发 VPS，没填或发不出去自动改回本地下载。
+// @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采；罗盘自营/合作视频按“流量来源”分行采（投放行与非投放行分开，标杆数只作对照）；短视频榜按榜单表头采 200 条。导出 SpaceImport/1.0 JSON，运维空间一键导入。新加的两条视频线只走本地下载，不发 VPS。
 // @author       Edison（运维空间打包）
 // @match        *://compass.jinritemai.com/shop/search/drainage-terms*
 // @match        *://fxg.jinritemai.com/ffa/mcompass/search*
+// @match        *://compass.jinritemai.com/shop/video/self*
+// @match        *://compass.jinritemai.com/shop/video/cooperate*
+// @match        *://compass.jinritemai.com/shop/chance/video-rank*
 // @match        https://creator.douyin.com/creator-micro/data-center/content*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -62,6 +65,38 @@
 // GitHub 网页上改，Tampermonkey 按 @updateURL 自动更新。
 // ============================================================
 
+// v1.2.8 改动（2026-11-13 已推，未在 lin 登着后台的浏览器里实测）：
+// 新加两条视频线，接的是 2026-11-11 三份探针实测的表头（probe-all-2026-11-11-16-33-19.json），
+// 不是五六月份旧地图：
+//  ① 罗盘自营视频 /shop/video/self、合作视频 /shop/video/cooperate：单表无分页，
+//     表头：流量来源 | 视频观看次数(占比) | 商品曝光次数 | 商品点击次数 | 用户支付金额(占比)
+//     | 成交订单数 | 商品千次曝光成交 | 引流直播用户支付金额(占比) | 引流直播间次数
+//     | 引流直播成交订单数。格子是“自家数 + 同行标杆”拼的（如 '76 同行标杆 1,162'），
+//     用 parseOwnVsBenchmark 拆开：自家值、标杆值分开存，标杆只作对照，绝不拿标杆数
+//     当自家数算转化率（2026-11-11 lin 纠正：投放行标杆是烧钱烧出来的，花多少不知道）。
+//     流量来源那列原样导出（'全域+乘方投放时段' / '非投放时段' / 以后出现的新行），
+//     投放和非投放分行算，不混在一起。缺“流量来源/视频观看次数/商品曝光次数/
+//     商品点击次数/用户支付金额/成交订单数”任一列就停下报错，不瞎采。
+//     缺列的闸比旧线更严：必备列只认按名认到，按位置对上的不算数——删了一列
+//     不能悄悄拿邻列的数顶替。离线自查还抓到一处孪生列陷阱：删掉“成交订单数”后，
+//     包含式 core 匹配会把它认到“引流直播成交订单数”那列去（“用户支付金额”同理，
+//     会认到“引流直播用户支付金额”），18 项里那 1 项失败就是它；修法是 nameMatched，
+//     core 模式只认核心词完全相等的，不认包含式命中，修好后才全过。
+//     注意：探针只存了前两行样本，自营页非投放那行只知道存在（rowCount 3 = 表头 + 2 行数据），
+//     具体数值探针里没有——脚本不猜，跑起来有几行就采几行。
+//  ② 短视频榜 /shop/chance/video-rank（这才是短视频榜）：表头：排名 | 短视频 | 观看次数
+//     | 用户支付金额 | 点赞数 | 评论数 | 转发数 | 关联商品 | 操作；每页 20 条，共 10 页，200 条。
+//     纠正：/shop/chance/rank-video 表头是“直播内容/直播用户支付金额”，那是直播榜，
+//     不是短视频榜，这版不接它，别接错页。榜单数值多是区间（'100万 - 250万'），
+//     区间原样保留不转数；'一键跟拍'记成 follow_shoot，方便以后抄标。
+//     翻页复用搜索词那套：aurora 分页、先读总页数、翻页前停 3~7 秒随机、
+//     签名看第二行 + 末行、表头行跳过。
+//  两条新线只走本地下载，不发 VPS（2026-11-10 lin 定：先跑本地，不加 VPS；
+//  收数端没装、钥匙也没生成）。旧两条线（搜索词、创作者视频）逻辑一字不动，
+//  只把导出里的 collector 版本字样从 v1.2.0 改成 v1.2.8。
+//  商品榜 /shop/chance/rank-product（200 条、20 页）这次没接，留到视频榜跑通后再接，
+//  一层一层加，不一口吃掉。
+//
 (function () {
 'use strict';
 
@@ -243,6 +278,64 @@ function fingerprintSearchTable(headers) {
   return hit >= 3;
 }
 
+
+// parseOwnVsBenchmark：罗盘自营/合作视频表的格子是“自家数 + 同行标杆”拼在一起，
+// 如 '76 同行标杆 1,162'、'75 （ 12.63% ） 同行标杆 597'、'¥0 （ 0% ） 同行标杆 ¥2,737.14'。
+// 拆成自家值 / 自家占比 / 标杆值，三者都留原文；没有“同行标杆”时整格就是自家值。
+// 标杆只作对照，绝不拿标杆数当自家数算转化率（2026-11-11 lin 纠正：投放行标杆是烧钱烧出来的）。
+function parseOwnVsBenchmark(rawText) {
+  var raw = cleanText(rawText);
+  var out = { own: null, ownText: '', ownShare: null, ownShareText: '', benchmark: null, benchmarkText: '', raw: raw };
+  if (!raw || raw === '-' || raw === '--' || raw === '暂无' || raw === '—') return out;
+  var parts = raw.split('同行标杆');
+  var ownPart = cleanText(parts[0]);
+  out.ownText = ownPart;
+  var shareM = ownPart.match(/[(（]\s*([\d.]+)\s*%\s*[)）]/);
+  if (shareM) {
+    out.ownShare = Math.round((parseFloat(shareM[1]) / 100) * 10000) / 10000;
+    out.ownShareText = shareM[1] + '%';
+    ownPart = cleanText(ownPart.replace(/[(（]\s*[\d.]+\s*%\s*[)）]/, ''));
+    out.ownText = ownPart;
+  }
+  var ownCv = cleanValue(ownPart);
+  out.own = ownCv.num;
+  if (parts.length > 1) {
+    var benchPart = cleanText(parts.slice(1).join('同行标杆'));
+    out.benchmarkText = benchPart;
+    var benchCv = cleanValue(benchPart);
+    out.benchmark = benchCv.num;
+  }
+  return out;
+}
+
+// splitRankVideoCell：短视频榜“短视频”格是标题 + 店铺 + 发布时间拼在一起，
+// 如 '装甲蜗牛双十一活动开始了！#双十一 … 装甲蜗牛山巅汽车用品专卖店 11/03 17:30'。
+// 只拆出发布时间（MM/DD HH:MM），标题和店铺不硬拆，全文留 raw。
+function splitRankVideoCell(rawText) {
+  var raw = cleanText(rawText);
+  var m = raw.match(/(\d{2}\/\d{2}\s+\d{2}:\d{2})/);
+  return { raw: raw, publishTime: m ? m[1] : '', title: m ? cleanText(raw.split(m[1])[0]) : raw };
+}
+
+// nameMatched：必备列“按名认到”才算数（新线专用闸）。
+// exact/learned 直接算；core 模式只认核心词完全相等的那种，不认“包含”式命中——
+// '成交订单数'绝不能认到'引流直播成交订单数'那列去，'用户支付金额'也不能认到
+// '引流直播用户支付金额'那列去（两对孪生列，buildColumnMap 的包含式 core 匹配会抓错）。
+// pos（按位置对上）不算数。缺了就报缺列停下，不拿邻列/孪生列的数顶替。
+function nameMatched(built, headers, spec, key) {
+  var idx = built.map[key];
+  if (idx === undefined) return false;
+  var how = built.how[key];
+  if (how === 'exact' || how === 'learned') return true;
+  if (how === 'core') {
+    var sp = null;
+    for (var i = 0; i < spec.length; i++) { if (spec[i].key === key) { sp = spec[i]; break; } }
+    if (!sp) return false;
+    return coreOf(headers[idx]) === coreOf(sp.exact);
+  }
+  return false;
+}
+
 /* __PURE_END__ */
 
 // ---- 通用：表头、表格查找、日期、导出、面板 ----
@@ -250,7 +343,9 @@ function fingerprintSearchTable(headers) {
 var STORE_KEYS = {
   compassSearch: 'spaceImport.collector.compassSearch.v1',
   creatorVideo: 'spaceImport.collector.creatorVideo.v1',
-  creatorVideoReport: 'spaceImport.collector.creatorVideo.report.v1'
+  creatorVideoReport: 'spaceImport.collector.creatorVideo.report.v1',
+  compassVideo: 'spaceImport.collector.compassVideo.v1',
+  videoRank: 'spaceImport.collector.videoRank.v1'
 };
 // ---- 设置面板（v1.2 新增）：VPS 地址 + 钥匙，存在浏览器本地 ----
 // 钥匙绝不写进这个文件，绝不打印到日志、绝不出现在状态文字里。
@@ -407,7 +502,7 @@ function exportSpaceImport(dataset, platform, rows, meta) {
     partial: !!meta.partial,
     partial_reason: meta.partialReason || '',
     errors: meta.errors || [],
-    collector: 'operations-space-collector v1.2.0 (DOM only, no API interception)'
+    collector: 'operations-space-collector v1.2.8 (DOM only, no API interception)'
   };
   // v1.2：填了 VPS 地址+钥匙就先发 VPS，成功就不下载；没填、或 VPS 没收到，
   // 都自动改回下载到本地，数不丢。GM_xmlhttpRequest 是异步的，返回 null
@@ -452,7 +547,7 @@ function makePanel(title) {
     '<button id="sip-save-settings" style="width:100%;padding:8px;background:#909399;color:#fff;border:none;border-radius:4px;cursor:pointer;">保存设置</button>' +
     '<div id="sip-settings-status" style="font-size:11px;color:#999;margin-top:6px;"></div>' +
     '</div>' +
-    '<div style="font-size:11px;color:#999;margin-top:8px;">纯 DOM 采集，不拦截 API；缺列/0 行不导出空文件。v1.2.7：创作者中心一键采集带进度和完成报告。</div>' +
+    '<div style="font-size:11px;color:#999;margin-top:8px;">纯 DOM 采集，不拦截 API；缺列/0 行不导出空文件。v1.2.8：创作者中心一键采集带进度和完成报告；新加罗盘视频（分投放/非投放行）与短视频榜。</div>' +
     '</div>';
   document.body.appendChild(panel);
   var head = panel.querySelector('#sip-head');
@@ -623,11 +718,13 @@ function readPaginationTotal() {
 }
 
 // V4.0 waitForNewData 的改写：行签名（行数＋首行）变化才算翻页成功。
-async function waitForNewData(table, prevSig, isCollecting) {
+// fingerprintFn 可选，默认搜索词表指纹；短视频榜翻页时传自己的指纹。
+async function waitForNewData(table, prevSig, isCollecting, fingerprintFn) {
+  var fp = fingerprintFn || fingerprintSearchTable;
   var maxWait = 10000, interval = 500, waited = 0;
   while (waited < maxWait) {
     if (isCollecting && !isCollecting()) return false;
-    var t = findTableByFingerprint(fingerprintSearchTable);
+    var t = findTableByFingerprint(fp);
     var cur = t ? t.table : table;
     if (cur && rowSignature(cur) !== prevSig) return true;
     await sleep(interval);
@@ -639,19 +736,45 @@ async function waitForNewData(table, prevSig, isCollecting) {
 // 翻到第 targetPage 页：先点页码数字，再点“下一页”；
 // 点一次没动静就再点一次（加载慢、第一次点击被加载态吞掉很常见）。
 // 返回 'ok' | 'no-button' | 'timeout' | 'stopped'。
-async function gotoPage(targetPage, prevSig, isCollecting) {
+async function gotoPage(targetPage, prevSig, isCollecting, fingerprintFn) {
   var btn = findPageButton(targetPage) || findNextButton();
   if (!btn) return 'no-button';
   btn.click();
-  if (await waitForNewData(null, prevSig, isCollecting)) return 'ok';
+  if (await waitForNewData(null, prevSig, isCollecting, fingerprintFn)) return 'ok';
   if (isCollecting && !isCollecting()) return 'stopped';
   var btn2 = findPageButton(targetPage) || findNextButton();
   if (btn2) {
     btn2.click();
-    if (await waitForNewData(null, prevSig, isCollecting)) return 'ok';
+    if (await waitForNewData(null, prevSig, isCollecting, fingerprintFn)) return 'ok';
   }
   if (isCollecting && !isCollecting()) return 'stopped';
   return 'timeout';
+}
+
+// 新线路（v1.2.8）只走本地下载：2026-11-10 lin 定“先跑本地，不加 VPS”，
+// 收数端没装、钥匙也没生成，新页不发 VPS，数直接落本地文件。
+function exportLocal(dataset, platform, rows, meta) {
+  var now = new Date();
+  var stamp = now.toISOString().slice(0, 10);
+  var file = 'space-import-' + dataset + '-' + stamp + '.json';
+  var payload = {
+    protocol: 'SpaceImport/1.0',
+    platform: platform,
+    dataset: dataset,
+    source_url: location.href,
+    captured_at: now.toISOString(),
+    date_range_text: meta.dateRangeText || '',
+    date_range: meta.dateRange || null,
+    headers: meta.headers || [],
+    rows: rows,
+    total_rows: rows.length,
+    partial: !!meta.partial,
+    partialReason: meta.partialReason || '',
+    errors: meta.errors || [],
+    collector: 'operations-space-collector v1.2.8 (DOM only, no API interception, local download only)'
+  };
+  downloadJSON(file, payload);
+  return file;
 }
 
 // ============================================================
@@ -1051,7 +1174,7 @@ async function runVideoCollect() {
 }
 
 function initVideoPanel() {
-  var panel = makePanel('运维空间采集 · 抖音视频数据 v1.2.7');
+  var panel = makePanel('运维空间采集 · 抖音视频数据 v1.2.8');
   renderVideoReport();
   panel.querySelector('#sip-collect').textContent = '滚动加载并采集全部视频';
   panel.querySelector('#sip-all').style.display = 'none';
@@ -1069,6 +1192,360 @@ function initVideoPanel() {
   panelStatus('已就绪：打开创作者中心数据中心/内容页，点“滚动加载并采集全部视频”。先过表头校验，14 列缺一列就停下。');
 }
 
+// ============================================================
+// 线路 3：罗盘自营 / 合作视频（按流量来源分行）
+// 页面：compass.jinritemai.com/shop/video/self、/shop/video/cooperate
+// 表头（2026-11-11 探针实测，probe-all-2026-11-11-16-33-19.json）：
+// 流量来源 | 视频观看次数(占比) | 商品曝光次数 | 商品点击次数 | 用户支付金额(占比)
+// | 成交订单数 | 商品千次曝光成交 | 引流直播用户支付金额(占比) | 引流直播间次数 | 引流直播成交订单数
+// 单表无分页。行是流量来源本身（'全域+乘方投放时段' / '非投放时段'），
+// 有几行采几行，不写死只有两行。自营页探针 rowCount 3（表头 + 2 行数据），
+// 但样本只存了投放那行，非投放那行的数探针里没有——脚本不猜，跑起来见分晓。
+// ============================================================
+
+function fingerprintCompassVideo(headers) {
+  var joined = headers.join('|');
+  return joined.indexOf('流量来源') !== -1 && joined.indexOf('商品点击次数') !== -1 && joined.indexOf('成交订单数') !== -1;
+}
+
+var COMPASS_VIDEO_SPEC = [
+  { key: 'traffic_source', exact: '流量来源', core: '流量来源', pos: 0, allowIncludes: false },
+  { key: 'views', exact: '视频观看次数(占比)', core: '视频观看次数', pos: 1, allowIncludes: false },
+  { key: 'exposure', exact: '商品曝光次数', core: '商品曝光次数', pos: 2, allowIncludes: false },
+  { key: 'clicks', exact: '商品点击次数', core: '商品点击次数', pos: 3, allowIncludes: false },
+  { key: 'payment', exact: '用户支付金额(占比)', core: '用户支付金额', pos: 4, allowIncludes: false },
+  { key: 'orders', exact: '成交订单数', core: '成交订单数', pos: 5, allowIncludes: false },
+  { key: 'per_mille', exact: '商品千次曝光成交', core: '商品千次曝光成交', pos: 6, allowIncludes: false },
+  { key: 'live_payment', exact: '引流直播用户支付金额(占比)', core: '引流直播用户支付金额', pos: 7, allowIncludes: false },
+  { key: 'live_rooms', exact: '引流直播间次数', core: '引流直播间次数', pos: 8, allowIncludes: false },
+  { key: 'live_orders', exact: '引流直播成交订单数', core: '引流直播成交订单数', pos: 9, allowIncludes: false }
+];
+var COMPASS_VIDEO_REQUIRED = ['traffic_source', 'views', 'exposure', 'clicks', 'payment', 'orders'];
+
+var compassVideoState = { rows: [], headers: [], errors: [], running: false, stop: false };
+
+async function runCompassVideoCollect() {
+  if (compassVideoState.running) return;
+  compassVideoState.running = true;
+  compassVideoState.stop = false;
+  compassVideoState.errors = [];
+  panelErrors([]);
+  var pageKind = location.pathname.indexOf('/shop/video/cooperate') !== -1 ? 'cooperate' : 'self';
+  var dataset = pageKind === 'cooperate' ? 'compass_video_cooperate' : 'compass_video_self';
+  try {
+    panelStatus('正在等视频表出来…（最多 15 秒）');
+    var found = null;
+    for (var w = 0; w < 30 && !found; w++) {
+      found = findTableByFingerprint(fingerprintCompassVideo);
+      if (!found) await sleep(500);
+    }
+    if (!found) {
+      compassVideoState.errors = ['等了 15 秒还是没找到视频表：页面上没有含“流量来源/商品点击次数/成交订单数”的表格。请确认打开的是罗盘自营视频或合作视频页，且表格已加载。'];
+      panelErrors(compassVideoState.errors);
+      panelStatus('已停：' + compassVideoState.errors[0]);
+      return;
+    }
+    var table = found.table;
+    var headers = readHeaders(table);
+    var learned = loadHeaderAlts();
+    var built = buildColumnMap(headers, COMPASS_VIDEO_SPEC, learned);
+    // 必备列只认“按名认到”（nameMatched）：按位置对上的、含糊认到孪生列的都不算数，
+    // 缺了就停下，不拿邻列的数顶替（2026-11-11 lin 定：缺列先停下不采）。
+    var missingRequired = COMPASS_VIDEO_REQUIRED.filter(function (k) { return !nameMatched(built, headers, COMPASS_VIDEO_SPEC, k); });
+    if (missingRequired.length) {
+      var missingNames = missingRequired.map(function (k) {
+        var sp = COMPASS_VIDEO_SPEC.filter(function (x) { return x.key === k; })[0];
+        return sp ? sp.exact : k;
+      });
+      compassVideoState.errors = ['表头缺列，先停下不采：缺 ' + missingNames.join('、') + '。页面实际表头：' + headers.join(' | ')];
+      panelErrors(compassVideoState.errors);
+      panelStatus('已停：' + compassVideoState.errors[0]);
+      return;
+    }
+    compassVideoState.headers = headers;
+    var newNames = Object.keys(built.learnedNew || {});
+    if (newNames.length) {
+      newNames.forEach(function (k) { learned[k] = (learned[k] || []).concat([built.learnedNew[k]]); });
+      saveHeaderAlts(learned);
+    }
+    var m = built.map;
+    var rows = table.querySelectorAll('tbody tr');
+    var seen = {};
+    compassVideoState.rows = [];
+    rows.forEach(function (tr) {
+      var cells = Array.from(tr.querySelectorAll('td'));
+      if (!cells.length) return;
+      if (cells.length === headers.length + 1) cells = cells.slice(1);
+      if (cells.length < headers.length) return;
+      function cellText(key) {
+        var c = cells[m[key]];
+        return c ? cleanText(c.innerText || c.textContent) : '';
+      }
+      var source = cellText('traffic_source').split(' ')[0] || cellText('traffic_source');
+      if (!source) return;
+      // tbody 第一行就是表头原文（2026-11-11 实测），不是数据，跳过。
+      if (source === headers[m['traffic_source']]) return;
+      if (seen[source]) return;
+      seen[source] = true;
+      function colOut(key) {
+        var p = parseOwnVsBenchmark(cellText(key));
+        return { own: p.own, ownText: p.ownText, ownShare: p.ownShare, ownShareText: p.ownShareText, benchmark: p.benchmark, benchmarkText: p.benchmarkText };
+      }
+      var views = colOut('views');
+      var exposure = colOut('exposure');
+      var clicks = colOut('clicks');
+      var payment = colOut('payment');
+      var orders = colOut('orders');
+      var perMille = colOut('per_mille');
+      var livePayment = colOut('live_payment');
+      var liveRooms = colOut('live_rooms');
+      var liveOrders = colOut('live_orders');
+      compassVideoState.rows.push({
+        kind: 'compass_video',
+        page: pageKind,
+        traffic_source: source,
+        views_own: views.own, views_own_text: views.ownText, views_own_share: views.ownShare, views_own_share_text: views.ownShareText, views_benchmark: views.benchmark, views_benchmark_text: views.benchmarkText,
+        exposure_own: exposure.own, exposure_own_text: exposure.ownText, exposure_benchmark: exposure.benchmark, exposure_benchmark_text: exposure.benchmarkText,
+        clicks_own: clicks.own, clicks_own_text: clicks.ownText, clicks_benchmark: clicks.benchmark, clicks_benchmark_text: clicks.benchmarkText,
+        payment_own: payment.own, payment_own_text: payment.ownText, payment_own_share: payment.ownShare, payment_own_share_text: payment.ownShareText, payment_benchmark: payment.benchmark, payment_benchmark_text: payment.benchmarkText,
+        orders_own: orders.own, orders_own_text: orders.ownText, orders_benchmark: orders.benchmark, orders_benchmark_text: orders.benchmarkText,
+        per_mille_own: perMille.own, per_mille_own_text: perMille.ownText, per_mille_benchmark: perMille.benchmark, per_mille_benchmark_text: perMille.benchmarkText,
+        live_payment_own: livePayment.own, live_payment_own_text: livePayment.ownText, live_payment_benchmark: livePayment.benchmark, live_payment_benchmark_text: livePayment.benchmarkText,
+        live_rooms_own: liveRooms.own, live_rooms_own_text: liveRooms.ownText, live_rooms_benchmark: liveRooms.benchmark, live_rooms_benchmark_text: liveRooms.benchmarkText,
+        live_orders_own: liveOrders.own, live_orders_own_text: liveOrders.ownText, live_orders_benchmark: liveOrders.benchmark, live_orders_benchmark_text: liveOrders.benchmarkText
+      });
+    });
+    saveState(STORE_KEYS.compassVideo, { lastRun: new Date().toISOString(), page: pageKind, rows: compassVideoState.rows.length });
+    if (!compassVideoState.rows.length) {
+      panelStatus('0 行，未导出空文件。请确认表格已加载出数据行。');
+      return;
+    }
+    var file = exportLocal(dataset, 'douyin', compassVideoState.rows, {
+      dateRangeText: readDateRangeText(),
+      headers: headers,
+      partial: false,
+      partialReason: '',
+      errors: []
+    });
+    panelStatus('已导出 ' + file + '（' + compassVideoState.rows.length + ' 行，按流量来源分：' + compassVideoState.rows.map(function (r) { return r.traffic_source; }).join('、') + '）。只存本地，没发 VPS。');
+  } finally {
+    compassVideoState.running = false;
+  }
+}
+
+function initCompassVideoPanel() {
+  var panel = makePanel('运维空间采集 · 罗盘视频 v1.2.8');
+  panel.querySelector('#sip-collect').textContent = '采集本页（按流量来源分行）';
+  panel.querySelector('#sip-all').style.display = 'none';
+  panel.querySelector('#sip-collect').onclick = function () { runCompassVideoCollect(); };
+  panel.querySelector('#sip-stop').style.display = 'block';
+  panel.querySelector('#sip-stop').onclick = function () { compassVideoState.stop = true; panelStatus('正在停止…'); };
+  panel.querySelector('#sip-export').onclick = function () {
+    if (!compassVideoState.rows.length) { panelStatus('还没采到数据，先点“采集本页”。'); return; }
+    var dataset = location.pathname.indexOf('/shop/video/cooperate') !== -1 ? 'compass_video_cooperate' : 'compass_video_self';
+    var file = exportLocal(dataset, 'douyin', compassVideoState.rows, {
+      dateRangeText: readDateRangeText(), headers: compassVideoState.headers, partial: false, partialReason: '', errors: []
+    });
+    panelStatus('已导出 ' + file + '。只存本地，没发 VPS。');
+  };
+  panelStatus('已就绪：打开罗盘自营视频或合作视频页，点“采集本页”。投放行和非投放行分开采，标杆数只作对照。');
+}
+
+// ============================================================
+// 线路 4：短视频榜（市场 → 短视频排行）
+// 页面：compass.jinritemai.com/shop/chance/video-rank
+// 表头（2026-11-11 探针实测）：排名 | 短视频 | 观看次数 | 用户支付金额 | 点赞数
+// | 评论数 | 转发数 | 关联商品 | 操作；每页 20 条，共 10 页，200 条。
+// 注意别接错页：/shop/chance/rank-video 表头是“直播内容/直播用户支付金额”，
+// 那是直播榜，不是短视频榜。
+// ============================================================
+
+function fingerprintVideoRank(headers) {
+  var joined = headers.join('|');
+  return joined.indexOf('短视频') !== -1 && joined.indexOf('观看次数') !== -1 && joined.indexOf('用户支付金额') !== -1 && joined.indexOf('点赞数') !== -1;
+}
+
+var VIDEO_RANK_SPEC = [
+  { key: 'rank', exact: '排名', core: '排名', pos: 0, allowIncludes: false },
+  { key: 'video', exact: '短视频', core: '短视频', pos: 1, allowIncludes: false },
+  { key: 'views', exact: '观看次数', core: '观看次数', pos: 2, allowIncludes: false },
+  { key: 'payment', exact: '用户支付金额', core: '用户支付金额', pos: 3, allowIncludes: false },
+  { key: 'likes', exact: '点赞数', core: '点赞数', pos: 4, allowIncludes: false },
+  { key: 'comments', exact: '评论数', core: '评论数', pos: 5, allowIncludes: false },
+  { key: 'shares', exact: '转发数', core: '转发数', pos: 6, allowIncludes: false },
+  { key: 'products', exact: '关联商品', core: '关联商品', pos: 7, allowIncludes: true }
+];
+var VIDEO_RANK_REQUIRED = ['video', 'views', 'payment', 'likes', 'comments', 'shares'];
+
+var videoRankState = { rows: [], headers: [], errors: [], running: false, stop: false, partial: false, partialReason: '' };
+
+async function collectVideoRankPage() {
+  var found = null;
+  for (var w = 0; w < 30 && !found; w++) {
+    found = findTableByFingerprint(fingerprintVideoRank);
+    if (!found) await sleep(500);
+  }
+  if (!found) return { ok: false, errors: ['等了 15 秒还是没找到短视频榜表：页面上没有含“短视频/观看次数/点赞数”的表格。请确认打开的是市场-短视频排行页，且表格已加载。'] };
+  var table = found.table;
+  var headers = readHeaders(table);
+  var learned = loadHeaderAlts();
+  var built = buildColumnMap(headers, VIDEO_RANK_SPEC, learned);
+  // 必备列只认“按名认到”（nameMatched）：按位置对上的、含糊认到孪生列的都不算数，
+  // 缺了就停下，不拿邻列的数顶替（2026-11-11 lin 定：缺列先停下不采）。
+  var missingRequired = VIDEO_RANK_REQUIRED.filter(function (k) { return !nameMatched(built, headers, VIDEO_RANK_SPEC, k); });
+  if (missingRequired.length) {
+    var missingNames = missingRequired.map(function (k) {
+      var sp = VIDEO_RANK_SPEC.filter(function (x) { return x.key === k; })[0];
+      return sp ? sp.exact : k;
+    });
+    return { ok: false, errors: ['表头缺列，先停下不采：缺 ' + missingNames.join('、') + '。页面实际表头：' + headers.join(' | ')] };
+  }
+  videoRankState.headers = headers;
+  var newNames = Object.keys(built.learnedNew || {});
+  if (newNames.length) {
+    newNames.forEach(function (k) { learned[k] = (learned[k] || []).concat([built.learnedNew[k]]); });
+    saveHeaderAlts(learned);
+  }
+  var m = built.map;
+  var rows = table.querySelectorAll('tbody tr');
+  var added = 0;
+  var seen = {};
+  videoRankState.rows.forEach(function (r) { seen[r.rank + '|' + r.video_raw] = true; });
+  rows.forEach(function (tr) {
+    var cells = Array.from(tr.querySelectorAll('td'));
+    if (!cells.length) return;
+    if (cells.length === headers.length + 1) cells = cells.slice(1);
+    if (cells.length < headers.length) return;
+    function cellText(key) {
+      var c = cells[m[key]];
+      return c ? cleanText(c.innerText || c.textContent) : '';
+    }
+    var rank = cellText('rank');
+    // tbody 第一行就是表头原文（2026-11-11 实测），不是数据，跳过。
+    if (rank === '排名') return;
+    var videoCell = cells[m['video']];
+    var videoParts = videoCell ? extractCellParts(videoCell) : [];
+    var videoRaw = videoParts.join(' ');
+    if (!videoRaw) return;
+    var split = splitRankVideoCell(videoRaw);
+    var key = rank + '|' + videoRaw;
+    if (seen[key]) return;
+    seen[key] = true;
+    var views = cleanValue(cellText('views'));
+    var payment = cleanValue(cellText('payment'));
+    var likes = cleanValue(cellText('likes'));
+    var comments = cleanValue(cellText('comments'));
+    var shares = cleanValue(cellText('shares'));
+    var opText = m['products'] !== undefined && cells.length > 7 ? cleanText(cells[cells.length - 1].innerText || cells[cells.length - 1].textContent) : '';
+    videoRankState.rows.push({
+      kind: 'video_rank',
+      rank: rank,
+      video_raw: videoRaw,
+      video_title: split.title,
+      publish_time: split.publishTime,
+      views: views.num, views_text: views.raw, views_is_range: !!views.isRange, views_range: views.range,
+      payment: payment.num, payment_text: payment.raw, payment_is_range: !!payment.isRange, payment_range: payment.range,
+      likes: likes.num, likes_text: likes.raw,
+      comments: comments.num, comments_text: comments.raw,
+      shares: shares.num, shares_text: shares.raw,
+      linked_products: cellText('products'),
+      follow_shoot: opText.indexOf('一键跟拍') !== -1,
+      ops_text: opText
+    });
+    added++;
+  });
+  return { ok: true, added: added };
+}
+
+async function runVideoRankCollect(autoPaging) {
+  if (videoRankState.running) return;
+  videoRankState.running = true;
+  videoRankState.stop = false;
+  videoRankState.partial = false;
+  videoRankState.partialReason = '';
+  videoRankState.errors = [];
+  panelErrors([]);
+  var page = 1;
+  var maxPages = 500;
+  var total = readPaginationTotal();
+  var totalPages = total.totalPages;
+  videoRankState.totalPages = totalPages || 0;
+  videoRankState.pagesCollected = 0;
+  try {
+    while (!videoRankState.stop) {
+      panelStatus('正在采集第 ' + page + (totalPages ? ' / 共 ' + totalPages : '') + ' 页…（已采 ' + videoRankState.rows.length + ' 条）');
+      var res = await collectVideoRankPage();
+      if (!res.ok) {
+        videoRankState.errors = res.errors;
+        panelErrors(res.errors);
+        panelStatus('已停：' + res.errors[0]);
+        break;
+      }
+      videoRankState.pagesCollected = page;
+      panelStatus('第 ' + page + (totalPages ? ' / 共 ' + totalPages : '') + ' 页完成，本页新增 ' + res.added + ' 条，总计 ' + videoRankState.rows.length + ' 条');
+      if (!autoPaging) break;
+      if (totalPages && page >= totalPages) {
+        var more = findPageButton(page + 1) || findNextButton();
+        if (!more) break;
+        totalPages = null;
+        videoRankState.totalPages = 0;
+      }
+      if (page >= maxPages) break;
+      var found = findTableByFingerprint(fingerprintVideoRank);
+      if (!found) { videoRankState.partial = true; videoRankState.partialReason = '翻页后找不到表格，已采的 ' + videoRankState.rows.length + ' 条保留。'; break; }
+      var prevSig = rowSignature(found.table);
+      // 真人节奏：翻页前停 3~7 秒（随机），别像机器一样一页接一页点。
+      await sleep(3000 + Math.random() * 4000);
+      var nav = await gotoPage(page + 1, prevSig, function () { return !videoRankState.stop; }, fingerprintVideoRank);
+      if (nav === 'stopped') break;
+      if (nav === 'no-button') {
+        if (totalPages && page < totalPages) {
+          videoRankState.partial = true;
+          videoRankState.partialReason = '找不到下一页按钮（共 ' + totalPages + ' 页，只采到第 ' + page + ' 页）。';
+        }
+        break;
+      }
+      if (nav === 'timeout') {
+        videoRankState.partial = true;
+        videoRankState.partialReason = '第 ' + page + ' 页之后翻不动了' + (totalPages ? '（共 ' + totalPages + ' 页）' : '') + '，已采的 ' + videoRankState.rows.length + ' 条保留，导出为部分数据。';
+        break;
+      }
+      page++;
+    }
+  } finally {
+    videoRankState.running = false;
+    saveState(STORE_KEYS.videoRank, { lastRun: new Date().toISOString(), rows: videoRankState.rows.length, partial: videoRankState.partial });
+  }
+  if (videoRankState.rows.length === 0) {
+    panelStatus('0 行，未导出空文件。先看上面红字错误。');
+    return;
+  }
+  var file = exportLocal('compass_video_rank', 'douyin', videoRankState.rows, {
+    dateRangeText: readDateRangeText(),
+    headers: videoRankState.headers,
+    partial: videoRankState.partial,
+    partialReason: videoRankState.partialReason,
+    errors: videoRankState.errors
+  });
+  panelStatus('已采 ' + videoRankState.pagesCollected + (totalPages ? ' / 共 ' + totalPages : '') + ' 页，' + videoRankState.rows.length + ' 条' + (videoRankState.partial ? '，部分数据：' + videoRankState.partialReason : '') + '。只存本地，没发 VPS。');
+}
+
+function initVideoRankPanel() {
+  var panel = makePanel('运维空间采集 · 短视频榜 v1.2.8');
+  panel.querySelector('#sip-collect').onclick = function () { runVideoRankCollect(false); };
+  panel.querySelector('#sip-all').onclick = function () { runVideoRankCollect(true); };
+  panel.querySelector('#sip-stop').style.display = 'block';
+  panel.querySelector('#sip-stop').onclick = function () { videoRankState.stop = true; panelStatus('正在停止，停下后导出已采的…'); };
+  panel.querySelector('#sip-export').onclick = function () {
+    if (!videoRankState.rows.length) { panelStatus('还没采到数据，先点“采集本页”。'); return; }
+    var file = exportLocal('compass_video_rank', 'douyin', videoRankState.rows, {
+      dateRangeText: readDateRangeText(), headers: videoRankState.headers, partial: videoRankState.partial, partialReason: videoRankState.partialReason, errors: videoRankState.errors
+    });
+    panelStatus('已导出 ' + file + '。只存本地，没发 VPS。');
+  };
+  panelStatus('已就绪：打开市场-短视频排行页，点“采集本页”或“自动翻页采集”。200 条分 10 页，翻页前停 3~7 秒。');
+}
+
 // ---- 启动 ----
 (function boot() {
   function start() {
@@ -1078,6 +1555,10 @@ function initVideoPanel() {
       initVideoPanel();
     } else if (host.indexOf('jinritemai.com') !== -1 && (path.indexOf('/shop/search/drainage-terms') !== -1 || path.indexOf('/ffa/mcompass/search') !== -1)) {
       initSearchPanel();
+    } else if (host.indexOf('jinritemai.com') !== -1 && (path.indexOf('/shop/video/self') !== -1 || path.indexOf('/shop/video/cooperate') !== -1)) {
+      initCompassVideoPanel();
+    } else if (host.indexOf('jinritemai.com') !== -1 && path.indexOf('/shop/chance/video-rank') !== -1) {
+      initVideoRankPanel();
     }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
