@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         运维空间采集-深度探针
 // @namespace    https://workspace/operations-space
-// @version      1.0.0
-// @description  深度探针：拦截页面接口返回 + 抓非表结构。只读，不发任何额外请求。
+// @version      1.1.0
+// @description  深度探针：拦截页面接口返回 + 抓非表结构。只读，不发任何额外请求；正文跨页缓存，一次导出全有。
 // @match        https://compass.jinritemai.com/*
+// @match        https://fxg.jinritemai.com/*
 // @run-at       document-start
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-%E6%B7%B1%E5%BA%A6%E6%8E%A2%E9%92%88.user.js
@@ -11,39 +12,135 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  // 深度探针 v1.0.0（2026-11-12）
-  // 表只是数据最后长出来的样子。数据本身是 JSON 从接口拉回来的——表没出来，
-  // 不代表数据没到。这支脚本在数据回来的路上记下来，顺带抓非表结构。
-  // 只读：不发任何额外请求，不改请求，不改返回，不改页面行为。
-  // 跑在你自己的浏览器里，用你自己的登录态和指纹，不是另外一台机器在爬。
+  // 深度探针 v1.1.0（2026-11-12）
+  // v1.0 的毛病：正文只存内存，一跳页就丢，导出只有当前页；200 上限被监控噪音占满，
+  // 真正的数据接口被挤出去；链接里还带着登录 token。
+  // v1.1 改法：正文进 IndexedDB 跨页缓存，逛完一次导出全有；噪音域名直接不记；
+  // 链接里的 token 参数存之前去掉；单页应用跳页时按页切分记下来。
   var PAGE_KEY = 'spaceImport.deepProbe.pages.v1';
-  var MAX_CALLS = 200;      // 一页最多记 200 个接口
-  var MAX_BODY = 1024 * 1024; // 单个响应正文最多记 1MB
-  var calls = [];   // {url, method, status, time, bytes, isJson, keys, sample}
-  var bodies = {};  // url -> JSON 正文（只存能解析成 JSON 的）
+  var MAX_CALLS = 500;
+  var MAX_BODY = 1024 * 1024;
+  var MAX_STORED = 2000; // IndexedDB 里最多存 2000 条正文，满了就停并在面板说一声
+  var FRAME = (window === window.top) ? 'top' : 'iframe';
+  var calls = [];
+  var bodies = {};
+  var storedCount = 0;
+  var db = null;
+  var dbReady = false;
+  var dbFull = false;
 
-  function isStatic(url) {
+  // ---- 噪音域名：监控/上报/配置/图片 CDN，一律不记 ----
+  var SKIP_HOSTS = ['mon.zijieapi.com', 'mcs.zijieapi.com', 'mssdk.bytedance.com', 'abtestvm.bytedance.com', 'vcs.zijieapi.com', 'lf3-config.bytetcc.com', 'lf6-cdn2-tos.bytegoofy.com', 'api.feelgood.cn', 'replay.maidouke.com'];
+  function hostOf(url) { try { return new URL(url, location.href).hostname; } catch (e) { return ''; } }
+  function pathOf(url) { try { return new URL(url, location.href).pathname; } catch (e) { return url || ''; } }
+  function isNoise(url) {
+    var h = hostOf(url);
+    if (!h) return false;
+    for (var i = 0; i < SKIP_HOSTS.length; i++) if (h === SKIP_HOSTS[i] || h.endsWith('.' + SKIP_HOSTS[i])) return true;
+    if (/ecombdimg\.com$|byteimg\.com$|bytegoofy\.com$/.test(h)) return true;
     return /\.(js|css|png|jpg|jpeg|gif|svg|webp|woff2?|ttf|ico|map)(\?|$)/i.test(url);
   }
+  // 登录类接口只记元数据，不存正文（里面是账号信息）
+  function isAuthPath(url) { var p = pathOf(url); return p.indexOf('/ecomauth/') === 0 || p.indexOf('/passport/') !== -1; }
+  // 存正文的：金日买家域名下的数据类接口
+  function keepBody(url) {
+    var h = hostOf(url);
+    if (h !== 'compass.jinritemai.com' && !h.endsWith('.jinritemai.com')) return false;
+    if (isAuthPath(url)) return false;
+    return true;
+  }
+  // 链接里的登录凭证参数，存之前去掉
+  var STRIP_PARAMS = ['msToken', 'token', '_lid', 'fp', 'verifyFp', 'a_bogus', 'sec_user_id', 'sec_subject_uid', 'encode_member_id', 'sessionid', 'cookie'];
+  function cleanUrl(url) {
+    try {
+      var u = new URL(url, location.href);
+      for (var i = 0; i < STRIP_PARAMS.length; i++) u.searchParams.delete(STRIP_PARAMS[i]);
+      return u.toString();
+    } catch (e) { return url; }
+  }
+  function pagePath() { try { return location.pathname; } catch (e) { return ''; } }
+
+  // ---- IndexedDB：正文跨页缓存 ----
+  function openDb() {
+    try {
+      var req = indexedDB.open('spaceImportDeepProbe', 1);
+      req.onupgradeneeded = function () {
+        var d = req.result;
+        if (!d.objectStoreNames.contains('responses')) {
+          var s = d.createObjectStore('responses', { keyPath: 'id', autoIncrement: true });
+          s.createIndex('page', 'page', { unique: false });
+        }
+      };
+      req.onsuccess = function () { db = req.result; dbReady = true; countStored(); };
+      req.onerror = function () { db = null; };
+    } catch (e) { db = null; }
+  }
+  function countStored() {
+    if (!dbReady) return;
+    try {
+      var tx = db.transaction('responses', 'readonly');
+      var req = tx.objectStore('responses').count();
+      req.onsuccess = function () { storedCount = req.result || 0; refreshPanel(); };
+    } catch (e) {}
+  }
+  function idbPut(rec) {
+    if (!dbReady || dbFull) return;
+    if (storedCount >= MAX_STORED) { dbFull = true; refreshPanel(); return; }
+    try {
+      var tx = db.transaction('responses', 'readwrite');
+      tx.objectStore('responses').add(rec);
+      tx.oncomplete = function () { storedCount++; refreshPanel(); };
+      tx.onerror = function () {};
+    } catch (e) {}
+  }
+  function idbAll(cb) {
+    if (!dbReady) { cb([]); return; }
+    try {
+      var tx = db.transaction('responses', 'readonly');
+      var req = tx.objectStore('responses').getAll();
+      req.onsuccess = function () { cb(req.result || []); };
+      req.onerror = function () { cb([]); };
+    } catch (e) { cb([]); }
+  }
+  function idbClear(cb) {
+    if (!dbReady) { if (cb) cb(); return; }
+    try {
+      var tx = db.transaction('responses', 'readwrite');
+      var req = tx.objectStore('responses').clear();
+      req.onsuccess = function () { storedCount = 0; dbFull = false; if (cb) cb(); };
+      req.onerror = function () { if (cb) cb(); };
+    } catch (e) { if (cb) cb(); }
+  }
+  openDb();
+
   function record(url, method, status, text) {
     try {
-      var entry = { url: url, method: method, status: status, time: Date.now(), bytes: (text || '').length, isJson: false, keys: [], sample: '' };
+      if (isNoise(url)) return;
+      url = cleanUrl(url);
+      var entry = { url: url, method: method, status: status, time: Date.now(), frame: FRAME, bytes: (text || '').length, isJson: false, keys: [], sample: '' };
+      var isJ = false;
+      var keys = [];
       if (text) {
         try {
           var j = JSON.parse(text);
-          entry.isJson = true;
-          if (j && typeof j === 'object') entry.keys = Object.keys(j).slice(0, 40);
-          if (text.length <= MAX_BODY) bodies[url] = text;
-        } catch (e) { /* 不是 JSON，只记元数据 */ }
+          isJ = true;
+          if (j && typeof j === 'object') keys = Object.keys(j).slice(0, 40);
+        } catch (e) {}
+        entry.isJson = isJ;
+        entry.keys = keys;
         entry.sample = text.slice(0, 300);
       }
       calls.push(entry);
       if (calls.length > MAX_CALLS) calls.shift();
-      refreshCount();
+      if (isJ && text && text.length <= MAX_BODY && keepBody(url)) {
+        bodies[url] = text;
+        idbPut({ page: pagePath(), url: url, method: method, status: status, time: Date.now(), frame: FRAME, body: text });
+      }
+      refreshPanel();
     } catch (e) { /* 忽略，绝不能影响页面 */ }
   }
 
-  // ---- 拦截层：包 fetch 和 XHR，包完把 toString 还原成 native，页面查不出来 ----
+  // ---- 拦截层：包 fetch 和 XHR，包完把 toString 还原成 native ----
   try {
     var nativeFetch = window.fetch;
     window.fetch = function () {
@@ -53,19 +150,18 @@
       try {
         url = String((args[0] && args[0].url) || args[0] || '');
         method = String((args[1] && args[1].method) || (args[0] && args[0].method) || 'GET');
-      } catch (e) { /* 忽略 */ }
+      } catch (e) {}
       return nativeFetch.apply(this, args).then(function (resp) {
-        if (url && !isStatic(url)) {
+        if (url) {
           try {
             resp.clone().text().then(function (t) { record(url, method, resp.status, t); }).catch(function () {});
-          } catch (e) { /* 忽略 */ }
+          } catch (e) {}
         }
         return resp;
       });
     };
     window.fetch.toString = function () { return 'function fetch() { [native code] }'; };
-  } catch (e) { /* 忽略 */ }
-
+  } catch (e) {}
   try {
     var nativeOpen = XMLHttpRequest.prototype.open;
     var nativeSend = XMLHttpRequest.prototype.send;
@@ -77,7 +173,7 @@
       var xhr = this;
       try {
         var url = xhr._dpUrl || '';
-        if (url && !isStatic(url)) {
+        if (url) {
           xhr.addEventListener('load', function () {
             try {
               var t = '';
@@ -91,11 +187,40 @@
     };
     XMLHttpRequest.prototype.open.toString = function () { return 'function open() { [native code] }'; };
     XMLHttpRequest.prototype.send.toString = function () { return 'function send() { [native code] }'; };
-  } catch (e) { /* 忽略 */ }
+  } catch (e) {}
 
-  // ---- 工具 ----
+  // ---- 单页应用跳页：地址变了就按页切分记下来 ----
+  var lastPath = pagePath();
   function storeGet(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
   function storeSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function savePageSummary(path) {
+    var pages = storeGet(PAGE_KEY, {});
+    pages[path] = {
+      time: new Date().toISOString(), frame: FRAME, apiCount: calls.length,
+      apis: calls.map(function (c) { return c.method + ' ' + c.url + ' [' + c.status + '] ' + (c.isJson ? 'JSON ' + c.keys.length + '键' : '非JSON'); })
+    };
+    storeSet(PAGE_KEY, pages);
+  }
+  function onPathChange() {
+    var p = pagePath();
+    if (p === lastPath) return;
+    savePageSummary(lastPath);
+    lastPath = p;
+    calls.length = 0;
+    bodies = {};
+    refreshPanel();
+  }
+  try {
+    var nativePush = history.pushState;
+    var nativeReplace = history.replaceState;
+    history.pushState = function () { var r = nativePush.apply(this, arguments); setTimeout(onPathChange, 300); return r; };
+    history.replaceState = function () { var r = nativeReplace.apply(this, arguments); setTimeout(onPathChange, 300); return r; };
+    window.addEventListener('popstate', function () { setTimeout(onPathChange, 300); });
+    setInterval(onPathChange, 2000);
+  } catch (e) {}
+  window.addEventListener('beforeunload', function () { savePageSummary(lastPath); });
+
+  // ---- 工具 ----
   function stamp() {
     var d = new Date();
     function p(n) { return (n < 10 ? '0' : '') + n; }
@@ -112,9 +237,8 @@
   }
   function elText(el) { return ((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()); }
 
-  // ---- 深结构：表 + 非表重复结构 + 页面可见文字 + 全局状态键 ----
   function deepDump() {
-    var out = { url: location.href, title: document.title, time: new Date().toISOString(), tables: [], lists: [], pageText: '', globals: [], pagination: '' };
+    var out = { url: location.href, title: document.title, time: new Date().toISOString(), frame: FRAME, tables: [], lists: [], pageText: '', globals: [], pagination: '', iframes: [] };
     try {
       var tables = document.querySelectorAll('table');
       for (var i = 0; i < tables.length; i++) {
@@ -133,20 +257,24 @@
       }
     } catch (e) {}
     try {
-      // 非表重复结构：找孩子多、孩子长得一样的容器（卡片墙、虚拟列表都长这样）
       var cands = [];
       var all = document.querySelectorAll('div,ul,section');
       for (var j = 0; j < all.length && j < 3000; j++) {
         var p = all[j];
-        var kids = p.children;
+        var kids = [];
+        for (var k = 0; k < p.children.length; k++) {
+          var tg = p.children[k].tagName;
+          if (tg === 'STYLE' || tg === 'SCRIPT' || tg === 'NOSCRIPT' || tg === 'TEMPLATE') continue;
+          kids.push(p.children[k]);
+        }
         if (kids.length < 3) continue;
         var tag0 = kids[0].tagName;
         var same = 0;
-        for (var k = 0; k < kids.length; k++) if (kids[k].tagName === tag0) same++;
+        for (var m = 0; m < kids.length; m++) if (kids[m].tagName === tag0) same++;
         if (same >= 3 && same === kids.length) {
           var texts = [];
-          for (var m = 0; m < Math.min(3, kids.length); m++) texts.push(elText(kids[m]).slice(0, 120));
-          cands.push({ tag: p.tagName, cls: (p.className && p.className.baseVal !== undefined) ? '' : String(p.className || '').slice(0, 80), count: kids.length, sample: texts });
+          for (var n = 0; n < Math.min(3, kids.length); n++) texts.push(elText(kids[n]).slice(0, 120));
+          cands.push({ tag: p.tagName, cls: String(p.className || '').slice(0, 80), count: kids.length, sample: texts });
         }
       }
       cands.sort(function (a, b) { return b.count - a.count; });
@@ -154,66 +282,86 @@
     } catch (e) {}
     try { out.pageText = (document.body.innerText || '').replace(/\s+\n/g, '\n').slice(0, 5000); } catch (e) {}
     try {
-      var keys = Object.keys(window).filter(function (k) { return /STATE|DATA|__STORE|redux|store/i.test(k); }).slice(0, 30);
+      var keys = Object.keys(window).filter(function (k) {
+        if (k.indexOf('on') === 0) return false;
+        return k.indexOf('_') === 0 || /Store|STORE|DataLayer|__DATA__/.test(k);
+      }).slice(0, 30);
       out.globals = keys.map(function (k) { var v; try { v = typeof window[k]; } catch (e) { v = '?'; } return k + ':' + v; });
     } catch (e) {}
     try {
       var pg = document.querySelector('ul.aurora-pagination');
       if (pg) out.pagination = elText(pg).slice(0, 200);
     } catch (e) {}
+    try {
+      var frs = document.querySelectorAll('iframe');
+      for (var f = 0; f < frs.length; f++) out.iframes.push({ src: (frs[f].src || '').slice(0, 200), name: frs[f].name || '' });
+    } catch (e) {}
     return out;
-  }
-
-  function savePageSummary() {
-    var pages = storeGet(PAGE_KEY, {});
-    var apis = calls.map(function (c) { return c.method + ' ' + c.url + ' [' + c.status + '] ' + (c.isJson ? 'JSON ' + c.keys.length + '键' : '非JSON'); });
-    pages[location.href.split('?')[0]] = { time: new Date().toISOString(), apiCount: calls.length, apis: apis };
-    storeSet(PAGE_KEY, pages);
   }
 
   // ---- 面板 ----
   var statusEl = null;
   var countEl = null;
-  function refreshCount() {
-    if (countEl) countEl.textContent = '已拦截接口：' + calls.length + ' 个（JSON ' + calls.filter(function (c) { return c.isJson; }).length + ' 个）';
+  function refreshPanel() {
+    if (!countEl) return;
+    var jn = calls.filter(function (c) { return c.isJson; }).length;
+    var txt = '本页接口：' + calls.length + ' 个（JSON ' + jn + ' 个）· 已缓存正文：' + storedCount + ' 条' + (dbFull ? '（已满，先导出再继续）' : '');
+    countEl.textContent = txt;
   }
   function status(msg) { if (statusEl) statusEl.textContent = msg; }
+  function exportAll() {
+    savePageSummary(lastPath);
+    status('正在从缓存里读全部页的数据…');
+    idbAll(function (rows) {
+      var byPage = {};
+      rows.forEach(function (r) {
+        var pg = byPage[r.page] || (byPage[r.page] = { calls: [], bodies: {} });
+        pg.calls.push({ url: r.url, method: r.method, status: r.status, time: r.time, frame: r.frame, bytes: (r.body || '').length });
+        pg.bodies[r.url] = r.body;
+      });
+      // 再把本页内存里还没进库的也带上
+      var cur = byPage[lastPath] || (byPage[lastPath] = { calls: [], bodies: {} });
+      calls.forEach(function (c) { cur.calls.push(c); });
+      Object.keys(bodies).forEach(function (u) { cur.bodies[u] = bodies[u]; });
+      var nPages = Object.keys(byPage).length;
+      var nBodies = 0;
+      Object.keys(byPage).forEach(function (p) { nBodies += Object.keys(byPage[p].bodies).length; });
+      downloadFile('deep-probe-all-' + stamp() + '.json', { tool: 'deep-probe/1.1.0', time: new Date().toISOString(), frame: FRAME, pages: storeGet(PAGE_KEY, {}), byPage: byPage });
+      status('已导出全部缓存：' + nPages + ' 页、' + nBodies + ' 个接口正文。发我。');
+    });
+  }
   function initPanel() {
     if (document.getElementById('sip-deepprobe-panel')) return;
     var box = document.createElement('div');
     box.id = 'sip-deepprobe-panel';
-    box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:999999;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:360px;';
-    box.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">深度探针 <span style="font-weight:400;color:#94a3b8;">v1.0.0 · 只读拦截</span></div>'
-      + '<div id="sip-dp-count" style="color:#7dd3fc;">已拦截接口：0 个</div>'
+    box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:999999;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:380px;';
+    box.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">深度探针 <span style="font-weight:400;color:#94a3b8;">v1.1.0 · 只读拦截 · ' + FRAME + '</span></div>'
+      + '<div id="sip-dp-count" style="color:#7dd3fc;">本页接口：0 个</div>'
       + '<div style="margin-top:8px;">'
-      + '<button id="sip-dp-export" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">导出本页接口数据</button>'
+      + '<button id="sip-dp-export-all" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">导出全部缓存</button>'
       + '<button id="sip-dp-dump" style="background:#059669;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;margin-right:6px;">抓本页深结构</button>'
-      + '<button id="sip-dp-clear" style="background:#475569;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">清空记录</button>'
+      + '<button id="sip-dp-clear" style="background:#475569;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;">清空缓存</button>'
       + '</div>'
-      + '<div id="sip-dp-status" style="color:#fbbf24;margin-top:6px;min-height:18px;">等页面加载完，接口会自动记下来。</div>';
+      + '<div id="sip-dp-status" style="color:#fbbf24;margin-top:6px;min-height:18px;">逛完要看的页，点“导出全部缓存”一次发我。</div>';
     document.body.appendChild(box);
     statusEl = document.getElementById('sip-dp-status');
     countEl = document.getElementById('sip-dp-count');
-    document.getElementById('sip-dp-export').onclick = function () {
-      savePageSummary();
-      downloadFile('deep-probe-' + stamp() + '.json', { tool: 'deep-probe/1.0.0', url: location.href, time: new Date().toISOString(), calls: calls, bodies: bodies, pages: storeGet(PAGE_KEY, {}) });
-      status('已导出本页 ' + calls.length + ' 个接口（含 JSON 正文），发我。');
-    };
+    document.getElementById('sip-dp-export-all').onclick = exportAll;
     document.getElementById('sip-dp-dump').onclick = function () {
       var d = deepDump();
-      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.0.0', dump: d });
-      status('深结构已导出：表 ' + d.tables.length + ' 张、重复结构 ' + d.lists.length + ' 处。发我。');
+      downloadFile('deep-dump-' + stamp() + '.json', { tool: 'deep-probe/1.1.0', dump: d });
+      status('深结构已导出：表 ' + d.tables.length + ' 张、重复结构 ' + d.lists.length + ' 处、iframe ' + d.iframes.length + ' 个。发我。');
     };
     document.getElementById('sip-dp-clear').onclick = function () {
-      calls.length = 0; bodies = {}; refreshCount(); status('已清空，从现在起重新记。');
+      calls.length = 0; bodies = {};
+      try { localStorage.removeItem(PAGE_KEY); } catch (e) {}
+      idbClear(function () { refreshPanel(); status('缓存已清空，从现在起重新记。'); });
     };
-    refreshCount();
+    refreshPanel();
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initPanel);
   } else {
     setTimeout(initPanel, 500);
   }
-  // 页面快关掉/跳走之前，把这页的接口清单记下来（正文只在导出时带走）
-  window.addEventListener('beforeunload', savePageSummary);
 })();
