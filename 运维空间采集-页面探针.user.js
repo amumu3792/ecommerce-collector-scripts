@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.1.9
+// @version      1.2.0
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -20,6 +20,7 @@
   var WALK_KEY = 'spaceImport.probe.walk.v1';
   var SUBMENU_KEY = 'spaceImport.probe.submenus.v1';
   var PACE_KEY = 'spaceImport.probe.pace.v1';
+  var COUNT_KEY = 'spaceImport.probe.count.v1'; // 收录页数镜像（面板显示用，存在本地）
   // 真人节奏：每页停留 15~30 秒再走（默认慢速），间隔随机，不机械。
   // 平台反爬看的就是短时间内连续请求，宁可慢，不能快到报“请求太快”影响账号。
   // 2026-11-11 实测：65 页里 53 页抓空，就是翻得太快、表还没出来就抓了。
@@ -45,6 +46,70 @@
     try { localStorage.removeItem(k); } catch (e) { /* 忽略 */ }
   }
 
+  // ---- IndexedDB：预采集存整表行数 + 页面文字，localStorage 装不下 ----
+  var probeDb = null;
+  var probeDbReady = false;
+  (function openProbeDb() {
+    try {
+      var req = indexedDB.open('spaceImportProbe', 1);
+      req.onupgradeneeded = function () {
+        var d = req.result;
+        if (!d.objectStoreNames.contains('dumps')) d.createObjectStore('dumps', { keyPath: 'url' });
+      };
+      req.onsuccess = function () { probeDb = req.result; probeDbReady = true; migrateOldDumps(); };
+      req.onerror = function () { probeDb = null; };
+    } catch (e) { probeDb = null; }
+  })();
+  function idbPutDump(d) {
+    if (!probeDbReady) {
+      try { var all = storeGet(STORE_KEY, {}); all[d.url] = d; storeSet(STORE_KEY, all); } catch (e) {}
+      return;
+    }
+    try {
+      var tx = probeDb.transaction('dumps', 'readwrite');
+      tx.objectStore('dumps').put(d);
+    } catch (e) {}
+  }
+  function idbAllDumps(cb) {
+    if (!probeDbReady) { cb(storeGet(STORE_KEY, {})); return; }
+    try {
+      var req = probeDb.transaction('dumps', 'readonly').objectStore('dumps').getAll();
+      req.onsuccess = function () {
+        var all = {};
+        (req.result || []).forEach(function (d) { all[d.url] = d; });
+        cb(all);
+      };
+      req.onerror = function () { cb(storeGet(STORE_KEY, {})); };
+    } catch (e) { cb(storeGet(STORE_KEY, {})); }
+  }
+  function idbClearDumps(cb) {
+    try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+    if (!probeDbReady) { if (cb) cb(); return; }
+    try {
+      var req = probeDb.transaction('dumps', 'readwrite').objectStore('dumps').clear();
+      req.onsuccess = function () { if (cb) cb(); };
+      req.onerror = function () { if (cb) cb(); };
+    } catch (e) { if (cb) cb(); }
+  }
+  // 旧版存在 localStorage 里的收录，一次性搬进 IDB 再删掉
+  function migrateOldDumps() {
+    try {
+      var old = storeGet(STORE_KEY, {});
+      var keys = Object.keys(old);
+      if (!keys.length) return;
+      var tx = probeDb.transaction('dumps', 'readwrite');
+      var st = tx.objectStore('dumps');
+      keys.forEach(function (k) { try { st.put(old[k]); } catch (e) {} });
+      tx.oncomplete = function () {
+        try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+        var urls = storeGet(COUNT_KEY, []);
+        keys.forEach(function (k) { if (urls.indexOf(k) === -1) urls.push(k); });
+        storeSet(COUNT_KEY, urls);
+        refreshPanel();
+      };
+    } catch (e) {}
+  }
+
   function elInfo(el) {
     var r = { tag: el.tagName.toLowerCase(), cls: (el.className && typeof el.className === 'string') ? el.className.slice(0, 200) : '' };
     if (el.id) r.id = el.id;
@@ -57,7 +122,7 @@
 
   function dump() {
     var out = {
-      tool: 'page-probe/1.1.8',
+      tool: 'page-probe/1.2.0',
       url: location.href,
       title: document.title,
       time: new Date().toISOString(),
@@ -68,17 +133,28 @@
       leftMenu: { title: '', items: [] },
       dateControls: [],
       buttons: [],
-      totalsText: []
+      totalsText: [],
+      pageText: ''
     };
 
+    // 预采集：整表行数全收下来，不只留 2 行样本。表头优先 thead，没有就拿 tbody 首行
+    // （罗盘的表就是 tbody 首行当表头）；首行当了表头就不再算数据行。
     Array.from(document.querySelectorAll('table')).forEach(function (tb, ti) {
-      var ths = Array.from(tb.querySelectorAll('thead th')).map(function (th) { return clean(th.innerText || th.textContent); });
+      var ths = Array.from(tb.querySelectorAll('thead th')).map(function (th) { return clean(th.innerText || th.textContent); }).filter(function (h) { return h; });
       var rows = Array.from(tb.querySelectorAll('tbody tr'));
-      var sample = rows.slice(0, 2).map(function (tr) {
-        return Array.from(tr.querySelectorAll('td')).map(function (td) { return clean(td.innerText || td.textContent).slice(0, 80); });
-      });
-      out.tables.push({ index: ti, headers: ths, rowCount: rows.length, sampleRows: sample });
+      var startRow = 0;
+      if (!ths.length && rows.length) {
+        ths = Array.from(rows[0].children).map(function (c) { return clean(c.innerText || c.textContent); });
+        startRow = 1;
+      }
+      var allRows = [];
+      for (var r = startRow; r < rows.length && allRows.length < 200; r++) {
+        allRows.push(Array.from(rows[r].children).map(function (c) { return clean(c.innerText || c.textContent).slice(0, 200); }));
+      }
+      out.tables.push({ index: ti, headers: ths, rowCount: rows.length - startRow, rows: allRows });
     });
+    // 页面可见文字：KPI 指标（曝光、点击、成交、同行优秀值）都在文字里，不在表里
+    try { out.pageText = clean(document.body.innerText || document.body.textContent || '').slice(0, 8000); } catch (e) { out.pageText = ''; }
 
     var pag = document.querySelector('.arco-pagination, .auxo-pagination, .ecom-pagination, [class*="pagination"]');
     if (pag) {
@@ -207,11 +283,30 @@
     }, 1000);
   }
 
+  // 滚动触发懒加载：很多页的表不滚到那就不加载（商品流量分析三轮空壳就是这个原因）。
+  // 一屏一屏往下滚到底，再滚回顶部；页本身不长就直接过。
+  function scrollToLoad(done) {
+    try {
+      var step = Math.max(400, window.innerHeight || 800);
+      var max = document.body ? document.body.scrollHeight : 0;
+      var y = 0;
+      if (max <= step + 100) { if (done) done(); return; }
+      var timer = setInterval(function () {
+        y += step;
+        window.scrollTo(0, y);
+        if (y >= max || y > step * 15) {
+          clearInterval(timer);
+          setTimeout(function () { window.scrollTo(0, 0); if (done) done(); }, 500);
+        }
+      }, 700);
+    } catch (e) { if (done) done(); }
+  }
+
   function savePage(d) {
-    var all = storeGet(STORE_KEY, {});
-    all[d.url] = d;
-    storeSet(STORE_KEY, all);
-    return Object.keys(all).length;
+    idbPutDump(d);
+    var urls = storeGet(COUNT_KEY, []);
+    if (urls.indexOf(d.url) === -1) { urls.push(d.url); storeSet(COUNT_KEY, urls); }
+    return urls.length;
   }
 
   function downloadFile(filename, obj) {
@@ -227,19 +322,26 @@
   function stamp() { return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-'); }
 
   function exportAll() {
-    var all = storeGet(STORE_KEY, {});
-    var pages = Object.keys(all).map(function (k) { return all[k]; });
-    if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
-    downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.1.8', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
-    status('已导出全部结构：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
+    status('正在从缓存里读全部页…');
+    idbAllDumps(function (all) {
+      var pages = Object.keys(all).map(function (k) { return all[k]; });
+      if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
+      downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.2.0', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
+      status('已导出全部预采集：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
+    });
   }
 
   function exportThisPage() {
-    var d = dump();
-    var n = savePage(d);
-    var pageSlug = location.pathname.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page';
-    downloadFile('page-probe-' + pageSlug + '-' + stamp() + '.json', d);
-    status('本页已导出，也已记下来（共收录 ' + n + ' 页）。');
+    status('正在滚到底触发加载…');
+    scrollToLoad(function () {
+      waitForTables(function () {
+        var d = dump();
+        var n = savePage(d);
+        var pageSlug = location.pathname.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page';
+        downloadFile('page-probe-' + pageSlug + '-' + stamp() + '.json', d);
+        status('本页已导出，也已记下来（共收录 ' + n + ' 页）。');
+      });
+    });
   }
 
   // ---- 下拉子页面枚举：逐项悬停顶栏，出来下拉就把里面的子页面记下来 ----
@@ -305,6 +407,11 @@
     collectSubmenus(function () { startWalkGo(onlyEmpty); });
   }
   function startWalkGo(onlyEmpty) {
+    scrollToLoad(function () {
+      waitForTables(function () { startWalkGoAfterLoad(onlyEmpty); });
+    });
+  }
+  function startWalkGoAfterLoad(onlyEmpty) {
       var d = dump();
       savePage(d);
       var queue = [];
@@ -320,27 +427,36 @@
         if (p.href.split('#')[0].split('?')[0] === location.href.split('#')[0].split('?')[0]) return;
         queue.push({ kind: 'url', href: p.href, name: p.name });
       });
-      if (onlyEmpty) {
-        // 只补空页：已经抓到表的页不再走；总览页本来就没表，抓回来还是空，不用反复补。
-        var all = storeGet(STORE_KEY, {});
-        var hasTable = {};
-        Object.keys(all).forEach(function (u) {
-          if ((all[u].tables || []).length) hasTable[pathOf(u)] = true;
-        });
-        queue = queue.filter(function (e) {
-          if (e.kind !== 'url') return true;
-          return !hasTable[pathOf(e.href)];
-        });
-        if (!queue.length) { status('空页都补完了，没有需要再走的页。'); refreshPanel(); return; }
+      function go() {
+        if (!queue.length) {
+          status('这页没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
+          refreshPanel();
+          return;
+        }
+        storeSet(WALK_KEY, { queue: queue, index: 0, queuedLeft: queuedLeft0, doneLeft: {}, startedAt: new Date().toISOString() });
+        status('开始扫全部页面，正在去：' + (queue[0].name || '') + '…');
+        setTimeout(function () { walkTakeNext(); }, 800);
       }
-      if (!queue.length) {
-        status('这页没认到可走的页面。已把这页结构记下来了，点“导出全部结构”发我，我再看。');
-        refreshPanel();
+      if (onlyEmpty) {
+        // 只补空页：已经抓到真表的页不再走；总览页本来就没表，抓回来还是空，不用反复补。
+        idbAllDumps(function (all) {
+          var hasTable = {};
+          Object.keys(all).forEach(function (u) {
+            var ts = all[u].tables || [];
+            for (var i = 0; i < ts.length; i++) {
+              if ((ts[i].headers || []).filter(function (h) { return h; }).length && ts[i].rowCount > 0) { hasTable[pathOf(u)] = true; break; }
+            }
+          });
+          queue = queue.filter(function (e) {
+            if (e.kind !== 'url') return true;
+            return !hasTable[pathOf(e.href)];
+          });
+          if (!queue.length) { status('空页都补完了，没有需要再走的页。'); refreshPanel(); return; }
+          go();
+        });
         return;
       }
-      storeSet(WALK_KEY, { queue: queue, index: 0, queuedLeft: queuedLeft0, doneLeft: {}, startedAt: new Date().toISOString() });
-      status('开始扫全部页面，正在去：' + (queue[0].name || '') + '…');
-      setTimeout(function () { walkTakeNext(); }, 800);
+      go();
   }
 
   function stopWalk() {
@@ -350,10 +466,10 @@
   }
 
   function walkFinish() {
-    var all = storeGet(STORE_KEY, {});
+    var n = storeGet(COUNT_KEY, []).length;
     storeDel(WALK_KEY);
-    status('全部扫完：共收录 ' + Object.keys(all).length + ' 页，正在下一个总文件…');
-    setTimeout(exportAll, 600);
+    status('全部扫完：共收录 ' + n + ' 页，正在下一个总文件…');
+    setTimeout(exportAll, 1500);
     refreshPanel();
   }
 
@@ -362,7 +478,7 @@
   function walkTakeNext() {
     var walk = storeGet(WALK_KEY, null);
     if (!walk) return;
-    waitForTables(function () { walkTakeNextGo(walk); });
+    scrollToLoad(function () { waitForTables(function () { walkTakeNextGo(walk); }); });
   }
   function walkTakeNextGo(walk) {
     var d = dump();
@@ -417,9 +533,9 @@
   }
 
   function refreshPanel() {
-    var all = storeGet(STORE_KEY, {});
+    var n = storeGet(COUNT_KEY, []).length;
     var countEl = document.getElementById('sip-probe-count');
-    if (countEl) countEl.textContent = '已收录 ' + Object.keys(all).length + ' 页';
+    if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
     var walk = storeGet(WALK_KEY, null);
     var stopBtn = document.getElementById('sip-probe-stop');
     if (stopBtn) stopBtn.style.display = walk ? 'inline-block' : 'none';
@@ -435,7 +551,7 @@
     div.id = 'sip-probe-panel';
     div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
     div.innerHTML = '<div id="sip-probe-head" style="display:flex;align-items:center;cursor:move;user-select:none;margin-bottom:4px;">'
-      + '<span style="font-weight:700;flex:1;">页面探针</span>'
+      + '<span style="font-weight:700;flex:1;">页面探针 <span style="font-weight:400;color:#94a3b8;">v1.2.0</span></span>'
       + '<button id="sip-probe-min" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:1px 8px;cursor:pointer;font-size:14px;line-height:1.4;">—</button>'
       + '</div>'
       + '<div id="sip-probe-body">'
@@ -509,9 +625,11 @@
     document.getElementById('sip-probe-all').onclick = exportAll;
     document.getElementById('sip-probe-one').onclick = exportThisPage;
     document.getElementById('sip-probe-clear').onclick = function () {
-      storeDel(STORE_KEY);
-      refreshPanel();
-      status('已清空，重新开始收。');
+      storeDel(COUNT_KEY);
+      idbClearDumps(function () {
+        refreshPanel();
+        status('已清空，重新开始收。');
+      });
     };
     refreshPanel();
 
@@ -523,11 +641,13 @@
       if (walk && walk.queue && walk.queue.length) {
         walkStep();
       } else {
-        waitForTables(function () {
-          var n = savePage(dump());
-        var countEl = document.getElementById('sip-probe-count');
-        if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
-          if (!storeGet(SUBMENU_KEY, []).length) collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
+        scrollToLoad(function () {
+          waitForTables(function () {
+            var n = savePage(dump());
+            var countEl = document.getElementById('sip-probe-count');
+            if (countEl) countEl.textContent = '已收录 ' + n + ' 页';
+            if (!storeGet(SUBMENU_KEY, []).length) collectSubmenus(function () { /* 后台认完，下次扫就用得上 */ });
+          });
         });
       }
     }, 3000);
