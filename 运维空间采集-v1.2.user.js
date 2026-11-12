@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 v1.2（抖店罗盘搜索词 + 抖音创作者中心视频）
 // @namespace    https://workspace/operations-space
-// @version      1.2.6
+// @version      1.2.7
 // @updateURL      https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @downloadURL    https://raw.githubusercontent.com/amumu3792/ecommerce-collector-scripts/main/%E8%BF%90%E7%BB%B4%E7%A9%BA%E9%97%B4%E9%87%87%E9%9B%86-v1.2.user.js
 // @description  纯 DOM 采集，不拦截 API、不写飞书、不改账号内容。抖店罗盘搜索词按表头原文指纹定位（商品曝光人数取“商品曝光人数”那列，绝不取第一个含“曝光人数”的列）；抖音创作者中心视频 14 列先过表头校验再采。导出 SpaceImport/1.0 JSON，运维空间一键导入。v1.2：设置面板里填一次 VPS 地址+钥匙（存浏览器本地，随时能改），填了就先发 VPS，没填或发不出去自动改回本地下载。
@@ -249,7 +249,8 @@ function fingerprintSearchTable(headers) {
 
 var STORE_KEYS = {
   compassSearch: 'spaceImport.collector.compassSearch.v1',
-  creatorVideo: 'spaceImport.collector.creatorVideo.v1'
+  creatorVideo: 'spaceImport.collector.creatorVideo.v1',
+  creatorVideoReport: 'spaceImport.collector.creatorVideo.report.v1'
 };
 // ---- 设置面板（v1.2 新增）：VPS 地址 + 钥匙，存在浏览器本地 ----
 // 钥匙绝不写进这个文件，绝不打印到日志、绝不出现在状态文字里。
@@ -439,6 +440,7 @@ function makePanel(title) {
     '<div id="sip-body" style="padding:12px;">' +
     '<div id="sip-status" style="background:#f5f7fa;padding:8px;border-radius:4px;margin-bottom:10px;font-size:12px;color:#606266;">就绪。只采当前页面，不改账号内容。</div>' +
     '<div id="sip-errors" style="display:none;background:#fef0f0;color:#f56c6c;padding:8px;border-radius:4px;margin-bottom:10px;font-size:12px;white-space:pre-wrap;"></div>' +
+    '<div id="sip-report" style="display:none;background:#f0f9eb;color:#606266;padding:8px;border-radius:4px;margin-bottom:10px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow-y:auto;"></div>' +
     '<button id="sip-collect" style="width:100%;padding:10px;background:#409eff;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin-bottom:8px;">采集本页</button>' +
     '<button id="sip-all" style="width:100%;padding:10px;background:#67c23a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin-bottom:8px;">自动翻页采集</button>' +
     '<button id="sip-stop" style="width:100%;padding:8px;background:#f56c6c;color:#fff;border:none;border-radius:4px;cursor:pointer;display:none;margin-bottom:8px;">停止并导出已采的</button>' +
@@ -450,7 +452,7 @@ function makePanel(title) {
     '<button id="sip-save-settings" style="width:100%;padding:8px;background:#909399;color:#fff;border:none;border-radius:4px;cursor:pointer;">保存设置</button>' +
     '<div id="sip-settings-status" style="font-size:11px;color:#999;margin-top:6px;"></div>' +
     '</div>' +
-    '<div style="font-size:11px;color:#999;margin-top:8px;">纯 DOM 采集，不拦截 API；缺列/0 行不导出空文件。v1.2：设置里填了 VPS 地址+钥匙就先发 VPS，没填就下载。</div>' +
+    '<div style="font-size:11px;color:#999;margin-top:8px;">纯 DOM 采集，不拦截 API；缺列/0 行不导出空文件。v1.2.7：创作者中心一键采集带进度和完成报告。</div>' +
     '</div>';
   document.body.appendChild(panel);
   var head = panel.querySelector('#sip-head');
@@ -506,6 +508,22 @@ function panelErrors(list) {
   el.style.display = 'block';
   el.textContent = list.join('\n');
 }
+// 完成报告：写面板里留着，也存浏览器本地，换页刷新还在。
+function videoReport(text) {
+  var el = document.getElementById('sip-report');
+  if (el) { el.style.display = text ? 'block' : 'none'; el.textContent = text || ''; }
+  try {
+    if (text) localStorage.setItem(STORE_KEYS.creatorVideoReport, text);
+    else localStorage.removeItem(STORE_KEYS.creatorVideoReport);
+  } catch (e) {}
+}
+function renderVideoReport() {
+  try {
+    var t = localStorage.getItem(STORE_KEYS.creatorVideoReport);
+    if (t) videoReport(t);
+  } catch (e) {}
+}
+function shortTime() { return new Date().toTimeString().slice(0, 5); }
 
 // ---- 翻页：先读总页数，再按页码翻到底（v1.2.4 改写） ----
 // 老做法只会一路点“下一页”，点不动就悄悄停，还当成采完了。
@@ -917,17 +935,37 @@ function parseVideoRow(tr, colMap) {
 }
 
 // 滚动加载：滚动到底，行数稳定 3 次才停（-6.6.8 loadAllData 的做法），最多 120 秒。
+// 每轮报一次已加载行数；表如果在内层滚动容器里（窗口滚不动），把表的所有祖先滚动容器也一起滚到底。
+function videoRowCount() {
+  var best = 0;
+  document.querySelectorAll('table').forEach(function (tb) {
+    var n = tb.querySelectorAll('tbody tr').length;
+    if (n > best) best = n;
+  });
+  return best;
+}
+function scrollVideoList() {
+  try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+  var tb = document.querySelector('table');
+  var n = tb;
+  while (n) {
+    try { if (n.scrollHeight > n.clientHeight + 50) n.scrollTop = n.scrollHeight; } catch (e2) {}
+    n = n.parentElement;
+  }
+}
 async function loadAllVideoRows() {
   return new Promise(function (resolve) {
     var last = -1, stable = 0, elapsed = 0;
     var iv = setInterval(function () {
       if (videoState.stop) { clearInterval(iv); resolve(false); return; }
-      window.scrollTo(0, document.body.scrollHeight);
-      var n = document.querySelectorAll('tbody tr').length;
+      scrollVideoList();
+      var n = videoRowCount();
+      videoState.loadedRows = n;
       if (n === last) { stable++; if (stable >= 3) { clearInterval(iv); setTimeout(function () { resolve(true); }, 1500); } }
       else { stable = 0; }
       last = n;
       elapsed += 1600;
+      panelStatus('正在滚动加载…已加载 ' + n + ' 行（稳定 ' + stable + '/3 次，已用 ' + Math.round(elapsed / 1000) + ' 秒）');
       if (elapsed >= 120000) { clearInterval(iv); resolve(true); }
     }, 1600);
   });
@@ -940,11 +978,21 @@ async function runVideoCollect() {
   videoState.errors = [];
   panelErrors([]);
   try {
+    videoReport('');
     panelStatus('正在滚动加载全部视频…（行数稳定 3 次后开始采）');
     await loadAllVideoRows();
-    if (videoState.stop) { panelStatus('已停止。'); return; }
+    if (videoState.stop) {
+      panelStatus('已停止。');
+      videoReport('已停止（' + shortTime() + '）：滚动加载到 ' + (videoState.loadedRows || 0) + ' 行后停下，未导出。');
+      return;
+    }
     var table = document.querySelector('table');
-    if (!table) { videoState.errors = ['未找到视频表格：请确认打开的是创作者中心数据中心/内容页。']; panelErrors(videoState.errors); panelStatus('已停：未找到视频表格。'); return; }
+    if (!table) {
+      videoState.errors = ['未找到视频表格：请确认打开的是创作者中心数据中心/内容页。'];
+      panelErrors(videoState.errors); panelStatus('已停：未找到视频表格。');
+      videoReport('没采成（' + shortTime() + '）：页面上没找到视频表格。请确认打开的是创作者中心数据中心/内容页，页面完全加载后再点一次。');
+      return;
+    }
     var headers = readHeaders(table);
     videoState.headers = headers;
     // 表头校验：14 列缺任何一列就报错停下，不按固定列号硬采。
@@ -953,6 +1001,7 @@ async function runVideoCollect() {
       videoState.errors = ['表头校验失败，缺列：' + missing.join('、') + '。页面实际表头：' + headers.join(' | ') + '。请先核对字段表 v1.1 §6，确认页面是否改版。'];
       panelErrors(videoState.errors);
       panelStatus('已停：表头对不上，不导出。');
+      videoReport('没采成（' + shortTime() + '）：表头对不上，缺列：' + missing.join('、') + '。\n页面实际表头：' + headers.join(' | ') + '。\n请把这段发给 Edison，页面可能改版了。');
       return;
     }
     var spec = VIDEO_HEADERS.map(function (h, i) { return { key: VIDEO_KEYS[i], exact: h, allowIncludes: false }; });
@@ -961,22 +1010,25 @@ async function runVideoCollect() {
       videoState.errors = ['表头映射失败，缺：' + built.missing.join('、')];
       panelErrors(videoState.errors);
       panelStatus('已停：表头映射失败。');
+      videoReport('没采成（' + shortTime() + '）：表头映射失败，缺：' + built.missing.join('、') + '。请把这段发给 Edison。');
       return;
     }
     var rows = table.querySelectorAll('tbody tr');
     var seen = {};
+    var skipped = 0;
     videoState.rows = [];
     rows.forEach(function (tr) {
       var r = parseVideoRow(tr, built.map);
-      if (!r) return;
+      if (!r) { skipped++; return; }
       var key = r.title + '|' + r.publish_time;
-      if (seen[key]) return;
+      if (seen[key]) { skipped++; return; }
       seen[key] = true;
       videoState.rows.push(r);
     });
     saveState(STORE_KEYS.creatorVideo, { lastRun: new Date().toISOString(), rows: videoState.rows.length });
     if (!videoState.rows.length) {
       panelStatus('0 行，未导出空文件。请确认页面已加载出视频行，且表头校验已通过。');
+      videoReport('没采成（' + shortTime() + '）：表头校验通过，但一行有效视频都没采到（页面行数 ' + rows.length + '，跳过 ' + skipped + ' 行）。请确认页面已加载出视频行。');
       return;
     }
     var file = exportSpaceImport('creator_video', 'douyin', videoState.rows, {
@@ -986,7 +1038,12 @@ async function runVideoCollect() {
       partialReason: '',
       errors: []
     });
-    if (file) panelStatus('已导出 ' + file + '（' + videoState.rows.length + ' 条视频）。');
+    var dr = readDateRangeText();
+    var report = '采完了（' + shortTime() + '）：' + videoState.rows.length + ' 条视频，表头 14 列全对，跳过 ' + skipped + ' 行（空行/重复）。'
+      + (dr ? '\n日期范围：' + dr : '')
+      + (file ? '\n文件：' + file + '（已下载到本地）' : '\n正在发往 VPS，发不出去会自动改下载。');
+    videoReport(report);
+    if (file) panelStatus('已导出 ' + file + '（' + videoState.rows.length + ' 条视频），报告在上面。');
     else panelStatus('正在发往 VPS…（' + videoState.rows.length + ' 条视频），发不出去会自动改下载。');
   } finally {
     videoState.running = false;
@@ -994,7 +1051,8 @@ async function runVideoCollect() {
 }
 
 function initVideoPanel() {
-  var panel = makePanel('运维空间采集 · 抖音视频数据 v1');
+  var panel = makePanel('运维空间采集 · 抖音视频数据 v1.2.7');
+  renderVideoReport();
   panel.querySelector('#sip-collect').textContent = '滚动加载并采集全部视频';
   panel.querySelector('#sip-all').style.display = 'none';
   panel.querySelector('#sip-collect').onclick = function () { runVideoCollect(); };
