@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.2.1
+// @version      1.2.2
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -21,6 +21,8 @@
   var SUBMENU_KEY = 'spaceImport.probe.submenus.v1';
   var PACE_KEY = 'spaceImport.probe.pace.v1';
   var COUNT_KEY = 'spaceImport.probe.count.v1'; // 收录页数镜像（面板显示用，存在本地）
+  var WALK_RESULT_KEY = 'spaceImport.probe.walkResults.v1'; // 本轮每页结果（有表/无表/空壳/失败）
+  var REPORT_KEY = 'spaceImport.probe.report.v1'; // 上次扫描的完成报告（面板里留着能再看）
   // 真人节奏：每页停留 15~30 秒再走（默认慢速），间隔随机，不机械。
   // 平台反爬看的就是短时间内连续请求，宁可慢，不能快到报“请求太快”影响账号。
   // 2026-11-11 实测：65 页里 53 页抓空，就是翻得太快、表还没出来就抓了。
@@ -126,7 +128,7 @@
 
   function dump() {
     var out = {
-      tool: 'page-probe/1.2.1',
+      tool: 'page-probe/1.2.2',
       url: normKey(location.href),
       fullUrl: location.href,
       title: document.title,
@@ -335,7 +337,7 @@
     idbAllDumps(function (all) {
       var pages = Object.keys(all).map(function (k) { return all[k]; });
       if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
-      downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.2.1', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
+      downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.2.2', exportedAt: new Date().toISOString(), pageCount: pages.length, report: storeGet(REPORT_KEY, null), pages: pages });
       status('已导出全部预采集：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
     });
   }
@@ -430,6 +432,9 @@
     collectSubmenus(function () { startWalkGo(onlyEmpty); });
   }
   function startWalkGo(onlyEmpty) {
+    storeDel(WALK_RESULT_KEY);
+    storeDel(REPORT_KEY);
+    refreshPanel();
     scrollToLoad(function () {
       waitForTables(function () { startWalkGoAfterLoad(onlyEmpty); });
     });
@@ -457,6 +462,7 @@
           return;
         }
         storeSet(WALK_KEY, { queue: queue, index: 0, queuedLeft: queuedLeft0, doneLeft: {}, startedAt: new Date().toISOString() });
+        recordResult(d.url, pageName(), classifyDump(d));
         status('开始扫全部页面，正在去：' + (queue[0].name || '') + '…');
         setTimeout(function () { walkTakeNext(); }, 800);
       }
@@ -484,6 +490,9 @@
 
   function stopWalk() {
     storeDel(WALK_KEY);
+    var rep = buildReport(true);
+    if (rep.total) storeSet(REPORT_KEY, rep);
+    storeDel(WALK_RESULT_KEY);
     status('已停止扫描。已收录的还在，点“导出全部结构”可以先发出来。');
     refreshPanel();
   }
@@ -491,7 +500,10 @@
   function walkFinish() {
     var n = storeGet(COUNT_KEY, []).length;
     storeDel(WALK_KEY);
-    status('全部扫完：共收录 ' + n + ' 页，正在下一个总文件…');
+    var rep = buildReport(false);
+    storeSet(REPORT_KEY, rep);
+    storeDel(WALK_RESULT_KEY);
+    status('全部扫完：共收录 ' + n + ' 页，报告在下面，正在下一个总文件…');
     setTimeout(exportAll, 1500);
     refreshPanel();
   }
@@ -506,6 +518,7 @@
   function walkTakeNextGo(walk) {
     var d = dump();
     var n = savePage(d);
+    recordResult(d.url, pageName(), classifyDump(d));
     refreshPanel();
     (d.leftMenu.items || []).forEach(function (it) {
       if (it.locked || it.active) return;
@@ -523,9 +536,16 @@
         setTimeout(function () { location.href = next.href; }, humanDelay());
         return;
       }
-      // click 项：只在本模块的页面上点得到，找不到了就跳过。
+      // click 项：只在本模块的页面上点得到。这页找不到就先排到队尾再试（最多 3 次），
+      // 免得走到别的模块时把这页静默丢了（15 条路径没新鲜数据就是这么丢的）；3 次都找不到就记失败。
       var el = document.querySelector('[data-left-menu-id="' + next.leftMenuId + '"]');
-      if (!el) continue;
+      if (!el) {
+        next.tries = (next.tries || 0) + 1;
+        if (next.tries < 3) { walk.queue.push(next); }
+        else { recordResult('click:' + next.leftMenuId, (next.parent ? next.parent + ' / ' : '') + next.name + '（没找到入口）', { result: 'fail', tables: 0, rows: 0 }); }
+        storeSet(WALK_KEY, walk);
+        continue;
+      }
       if (walk.doneLeft[next.leftMenuId]) continue;
       walk.doneLeft[next.leftMenuId] = true;
       storeSet(WALK_KEY, walk);
@@ -536,8 +556,10 @@
       var waited = 0;
       var timer = setInterval(function () {
         waited += 500;
-        if (location.href !== prevUrl || pageSig() !== prevSig || waited >= 10000) {
+        var changed = (location.href !== prevUrl || pageSig() !== prevSig);
+        if (changed || waited >= 10000) {
           clearInterval(timer);
+          if (!changed) recordResult('click:' + next.leftMenuId, (next.parent ? next.parent + ' / ' : '') + next.name + '（点了没反应）', { result: 'fail', tables: 0, rows: 0 });
           setTimeout(walkTakeNext, humanDelay());
         }
       }, 500);
@@ -548,6 +570,74 @@
 
   function walkStep() {
     walkTakeNext();
+  }
+
+  // 每页结果分类：有真表 ok / 有表但全空 empty / 没表但有文字 notable / 什么都没抓到 fail
+  function classifyDump(d) {
+    var tabs = d.tables || [];
+    var real = 0, rows = 0;
+    for (var i = 0; i < tabs.length; i++) {
+      var h = (tabs[i].headers || []).filter(function (x) { return x; }).length;
+      if (h && tabs[i].rowCount > 0) { real++; rows += tabs[i].rowCount; }
+    }
+    if (real) return { result: 'ok', tables: real, rows: rows };
+    if (tabs.length) return { result: 'empty', tables: tabs.length, rows: 0 };
+    if ((d.pageText || '').length > 100) return { result: 'notable', tables: 0, rows: 0 };
+    return { result: 'fail', tables: 0, rows: 0 };
+  }
+  function pageName() {
+    var t = (document.title || '').replace(/\s*[-_|]\s*抖店罗盘\s*$/, '').replace(/\s*[-_|]\s*罗盘\s*$/, '').trim();
+    return t || pathOf(location.href);
+  }
+  function recordResult(key, name, cls) {
+    try {
+      var res = storeGet(WALK_RESULT_KEY, {});
+      res[key] = { name: name, result: cls.result, tables: cls.tables || 0, rows: cls.rows || 0, time: new Date().toISOString() };
+      storeSet(WALK_RESULT_KEY, res);
+    } catch (e) {}
+  }
+  function resultCounts() {
+    var res = storeGet(WALK_RESULT_KEY, {});
+    var c = { total: 0, ok: 0, notable: 0, empty: 0, fail: 0 };
+    Object.keys(res).forEach(function (k) {
+      c.total++;
+      var r = res[k].result;
+      if (c[r] !== undefined) c[r]++;
+    });
+    return c;
+  }
+  function progressText(walk) {
+    var c = resultCounts();
+    var remain = walk ? Math.max(0, walk.queue.length - walk.index) : 0;
+    return '已走 ' + c.total + ' 页，待走 ' + remain + ' 页 · 有表 ' + c.ok + ' · 无表 ' + c.notable + ' · 空壳 ' + c.empty + ' · 失败 ' + c.fail;
+  }
+  function buildReport(stopped) {
+    var res = storeGet(WALK_RESULT_KEY, {});
+    var lists = { ok: [], notable: [], empty: [], fail: [] };
+    Object.keys(res).forEach(function (k) {
+      var r = res[k];
+      if (lists[r.result]) lists[r.result].push(r.name || k);
+    });
+    var c = resultCounts();
+    return {
+      stopped: !!stopped,
+      time: new Date().toTimeString().slice(0, 5),
+      total: c.total, ok: c.ok, notable: c.notable, empty: c.empty, fail: c.fail,
+      emptyNames: lists.empty.slice(0, 8), emptyMore: Math.max(0, lists.empty.length - 8),
+      failNames: lists.fail.slice(0, 8), failMore: Math.max(0, lists.fail.length - 8)
+    };
+  }
+  function renderReport() {
+    var el = document.getElementById('sip-probe-report');
+    if (!el) return;
+    var walk = storeGet(WALK_KEY, null);
+    if (walk) { el.textContent = '进行中 · ' + progressText(walk); return; }
+    var rep = storeGet(REPORT_KEY, null);
+    if (!rep) { el.textContent = ''; return; }
+    var t = (rep.stopped ? '已停止' : '上次扫完') + '（' + (rep.time || '') + '）：共走 ' + rep.total + ' 页，有真表 ' + rep.ok + '，无表 ' + rep.notable + '，空壳 ' + rep.empty + '，失败 ' + rep.fail + '。';
+    if (rep.emptyNames && rep.emptyNames.length) t += '\n空壳：' + rep.emptyNames.join('、') + (rep.emptyMore ? ' 等 ' + rep.emptyMore + ' 页' : '');
+    if (rep.failNames && rep.failNames.length) t += '\n失败：' + rep.failNames.join('、') + (rep.failMore ? ' 等 ' + rep.failMore + ' 页' : '');
+    el.textContent = t;
   }
 
   function status(msg) {
@@ -566,15 +656,16 @@
     if (walkBtn) walkBtn.style.display = walk ? 'none' : 'inline-block';
     var emptyBtn = document.getElementById('sip-probe-empty');
     if (emptyBtn) emptyBtn.style.display = walk ? 'none' : 'inline-block';
+    renderReport();
   }
 
   function init() {
     if (document.getElementById('sip-probe-panel')) return;
     var div = document.createElement('div');
     div.id = 'sip-probe-panel';
-    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
+    div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:320px;font-family:sans-serif;';
     div.innerHTML = '<div id="sip-probe-head" style="display:flex;align-items:center;cursor:move;user-select:none;margin-bottom:4px;">'
-      + '<span style="font-weight:700;flex:1;">页面探针 <span style="font-weight:400;color:#94a3b8;">v1.2.1</span></span>'
+      + '<span style="font-weight:700;flex:1;">页面探针 <span style="font-weight:400;color:#94a3b8;">v1.2.2</span></span>'
       + '<button id="sip-probe-min" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:1px 8px;cursor:pointer;font-size:14px;line-height:1.4;">—</button>'
       + '</div>'
       + '<div id="sip-probe-body">'
@@ -589,6 +680,7 @@
       + '<div><button id="sip-probe-one" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;">只导出本页</button>'
       + '<button id="sip-probe-clear" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:5px 10px;cursor:pointer;margin-left:6px;">清空已收录</button></div>'
       + '<div id="sip-probe-status" style="margin-top:8px;color:#94a3b8;"></div>'
+      + '<div id="sip-probe-report" style="margin-top:6px;color:#cbd5e1;font-size:12px;white-space:pre-line;word-break:break-all;max-height:150px;overflow-y:auto;"></div>'
       + '</div>';
     document.body.appendChild(div);
     // 面板可缩小、可拖拽（2026-11-12 lin：面板挡住翻页按钮没法挪）
@@ -649,6 +741,8 @@
     document.getElementById('sip-probe-one').onclick = exportThisPage;
     document.getElementById('sip-probe-clear').onclick = function () {
       storeDel(COUNT_KEY);
+      storeDel(REPORT_KEY);
+      storeDel(WALK_RESULT_KEY);
       idbClearDumps(function () {
         refreshPanel();
         status('已清空，重新开始收。');
