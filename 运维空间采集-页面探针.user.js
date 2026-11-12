@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         运维空间采集 · 页面探针
 // @namespace    https://github.com/amumu3792/ecommerce-collector-scripts
-// @version      1.2.0
+// @version      1.2.1
 // @description  罗盘全站通用探针。顶栏按 data-subway-href 认页面，左菜单按 data-left-menu-id 点一下走；点“一键扫全部页面”先悬停认下拉子页面，再自己一页一页翻过去抓完；平时正常逛也悄悄收录；最后点“导出全部结构”，只下一个总文件。
 // @author       Edison
 // @match        https://compass.jinritemai.com/*
@@ -56,7 +56,7 @@
         var d = req.result;
         if (!d.objectStoreNames.contains('dumps')) d.createObjectStore('dumps', { keyPath: 'url' });
       };
-      req.onsuccess = function () { probeDb = req.result; probeDbReady = true; migrateOldDumps(); };
+      req.onsuccess = function () { probeDb = req.result; probeDbReady = true; purgeOldDumps(); };
       req.onerror = function () { probeDb = null; };
     } catch (e) { probeDb = null; }
   })();
@@ -91,20 +91,24 @@
       req.onerror = function () { if (cb) cb(); };
     } catch (e) { if (cb) cb(); }
   }
-  // 旧版存在 localStorage 里的收录，一次性搬进 IDB 再删掉
-  function migrateOldDumps() {
+  // 清掉旧格式条目：v1.2.0 迁移进来的 11 号旧样本（只有 2 行样本、无页面文字）会混在导出里，
+  // 打开时一次性清掉，只留 v1.2.x 的预采集。localStorage 里的旧收录也直接删，不再搬。
+  function purgeOldDumps() {
+    try { localStorage.removeItem(STORE_KEY); } catch (e) {}
     try {
-      var old = storeGet(STORE_KEY, {});
-      var keys = Object.keys(old);
-      if (!keys.length) return;
       var tx = probeDb.transaction('dumps', 'readwrite');
       var st = tx.objectStore('dumps');
-      keys.forEach(function (k) { try { st.put(old[k]); } catch (e) {} });
-      tx.oncomplete = function () {
-        try { localStorage.removeItem(STORE_KEY); } catch (e) {}
-        var urls = storeGet(COUNT_KEY, []);
-        keys.forEach(function (k) { if (urls.indexOf(k) === -1) urls.push(k); });
-        storeSet(COUNT_KEY, urls);
+      var req = st.getAll();
+      req.onsuccess = function () {
+        var keep = [];
+        (req.result || []).forEach(function (d) {
+          if (d && typeof d.tool === 'string' && d.tool.indexOf('page-probe/1.2.') === 0) {
+            keep.push(d.url);
+          } else {
+            try { st.delete(d.url); } catch (e) {}
+          }
+        });
+        storeSet(COUNT_KEY, keep);
         refreshPanel();
       };
     } catch (e) {}
@@ -122,8 +126,9 @@
 
   function dump() {
     var out = {
-      tool: 'page-probe/1.2.0',
-      url: location.href,
+      tool: 'page-probe/1.2.1',
+      url: normKey(location.href),
+      fullUrl: location.href,
       title: document.title,
       time: new Date().toISOString(),
       tables: [],
@@ -146,6 +151,10 @@
       if (!ths.length && rows.length) {
         ths = Array.from(rows[0].children).map(function (c) { return clean(c.innerText || c.textContent); });
         startRow = 1;
+      } else if (ths.length && rows.length) {
+        // thead 有表头时，tbody 首行常常是同一行表头（重复），跳过它
+        var first = Array.from(rows[0].children).map(function (c) { return clean(c.innerText || c.textContent); });
+        if (first.length === ths.length && first.every(function (c, i) { return c === ths[i]; })) startRow = 1;
       }
       var allRows = [];
       for (var r = startRow; r < rows.length && allRows.length < 200; r++) {
@@ -326,7 +335,7 @@
     idbAllDumps(function (all) {
       var pages = Object.keys(all).map(function (k) { return all[k]; });
       if (!pages.length) { status('还没收录任何页面，先逛一逛或点“一键扫全部页面”。'); return; }
-      downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.2.0', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
+      downloadFile('probe-all-' + stamp() + '.json', { tool: 'page-probe/1.2.1', exportedAt: new Date().toISOString(), pageCount: pages.length, pages: pages });
       status('已导出全部预采集：' + pages.length + ' 页，一个文件，发给 Edison 就行。');
     });
   }
@@ -399,6 +408,20 @@
   // 本模块的点完再跳下一个顶栏页。
   function startWalk() { startWalkMode(false); }
   function startWalkEmpty() { startWalkMode(true); }
+  // 存储键归一化：平台跳转时会带 from_page/btm_* 追踪参数（btm_show_id 每次随机），
+  // 不去掉同一页会存成多份。只留有意义的参数（rank_type、tab 等）。
+  function normKey(u) {
+    try {
+      var a = new URL(u, location.href);
+      var keep = [];
+      a.searchParams.forEach(function (v, k) {
+        if (k === 'from_page' || k.indexOf('btm') === 0) return;
+        keep.push(k + '=' + v);
+      });
+      keep.sort();
+      return a.origin + a.pathname + (keep.length ? '?' + keep.join('&') : '');
+    } catch (e) { return u; }
+  }
   function pathOf(href) { try { return new URL(href).pathname; } catch (e) { return href.split('?')[0]; } }
   function startWalkMode(onlyEmpty) {
     var stored = storeGet(SUBMENU_KEY, []);
@@ -551,7 +574,7 @@
     div.id = 'sip-probe-panel';
     div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;box-shadow:0 4px 24px rgba(0,0,0,.4);max-width:300px;font-family:sans-serif;';
     div.innerHTML = '<div id="sip-probe-head" style="display:flex;align-items:center;cursor:move;user-select:none;margin-bottom:4px;">'
-      + '<span style="font-weight:700;flex:1;">页面探针 <span style="font-weight:400;color:#94a3b8;">v1.2.0</span></span>'
+      + '<span style="font-weight:700;flex:1;">页面探针 <span style="font-weight:400;color:#94a3b8;">v1.2.1</span></span>'
       + '<button id="sip-probe-min" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:6px;padding:1px 8px;cursor:pointer;font-size:14px;line-height:1.4;">—</button>'
       + '</div>'
       + '<div id="sip-probe-body">'
